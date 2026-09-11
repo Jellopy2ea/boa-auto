@@ -1,4 +1,6 @@
-// scraper.js V7 - FIX null - ใช้ API ตรงๆ ไม่กดปุ่ม เอาตัวล่าสุดแบบหุ้น
+
+// scraper.js V9 - FIX FINAL - ใช้ภาษาจริง A และ PSA10 ไม่ใช่ เอ / พีเอสเอ10
+// ดึงล่าสุดจริง แยก 2 ราคา จากแถวแรกของ 売買履歴
 import { chromium } from 'playwright';
 import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 
@@ -10,7 +12,7 @@ const R2 = new S3Client({
 const BUCKET = process.env.R2_BUCKET || 'cardmatem-raw';
 const FILE_KEY = 'boa-prices.json';
 const RATE = 0.245;
-const BATCH_SIZE = 4;
+const BATCH_SIZE = 46; // รวดเดียว 46 ใบ จบ
 
 async function getPrices() {
   const res = await R2.send(new GetObjectCommand({ Bucket: BUCKET, Key: FILE_KEY }));
@@ -19,98 +21,114 @@ async function getPrices() {
 async function putPrices(data) {
   data.updated = new Date().toISOString();
   await R2.send(new PutObjectCommand({ Bucket: BUCKET, Key: FILE_KEY, Body: JSON.stringify(data,null,2), ContentType: 'application/json' }));
-  console.log('✅ Uploaded', data.updated);
+  console.log('✅ Uploaded R2', data.updated);
 }
 
-// ดึงราคาล่าสุดโดยใช้ fetch ใน page context (ผ่าน Cloudflare ได้)
-async function fetchLatest(page, apparelId, status) {
-  return await page.evaluate(async ({id, st}) => {
-    // ลองหลาย endpoint ที่ SNKRDUNK ใช้จริง
-    const urls = [
-      `https://snkrdunk.com/api/v1/apparels/${id}/sales?status=${st}&limit=1&sort=sold_at_desc`,
-      `https://snkrdunk.com/api/v1/apparels/${id}/sales_histories?status=${st}&limit=1`,
-      `https://snkrdunk.com/v1/apparels/${id}/sales?status=${st}&per=1`,
-      `https://snkrdunk.com/apparels/${id}/sales-histories?status=${st}`
-    ];
-    for (const url of urls) {
-      try {
-        const res = await fetch(url, { credentials: 'include', headers: { 'Accept': 'application/json' } });
-        const text = await res.text();
-        if (!text) continue;
-        try {
-          const json = JSON.parse(text);
-          // หาราคาใน json
-          if (Array.isArray(json) && json[0]?.price) return { price: json[0].price, raw: json };
-          if (json.data && Array.isArray(json.data) && json.data[0]?.price) return { price: json.data[0].price, raw: json.data };
-          if (json.sales && Array.isArray(json.sales) && json.sales[0]?.price) return { price: json.sales[0].price, raw: json.sales };
-          if (json.price) return { price: json.price, raw: json };
-        } catch {
-          // ถ้าไม่ใช่ json ให้ลองหาด้วย regex ¥
-          const m = text.match(/(\d{3,6})\s*yen/i) || text.match(/¥\s*([0-9,]+)/);
-          if (m) return { price: parseInt(m[1].replace(/,/g,'')), raw: text.slice(0,500) };
-        }
-      } catch {}
+async function getLatestPriceFromHistory(page) {
+  await page.waitForTimeout(2000);
+  return await page.evaluate(() => {
+    // หาส่วน 売買履歴 แล้วเอาแถวแรก
+    const rows = document.querySelectorAll('table tr, div[class*="history"] div');
+    // วิธีชัวร์: หา text ¥xxxx ในส่วนล่างของหน้า หลังคำว่า 売買履歴
+    const body = document.body.innerHTML;
+    const idx = body.indexOf('売買履歴');
+    let searchArea = idx !== -1 ? document.body.innerText.slice(idx, idx+5000) : document.body.innerText;
+    
+    // เอา ¥ ตัวแรกที่เจอใน searchArea
+    const matches = [...searchArea.matchAll(/¥\s*([0-9,]+)/g)].map(m => parseInt(m[1].replace(/,/g,''),10)).filter(v=>v>=1000 && v<=3000000);
+    if (matches.length) return matches[0];
+
+    // fallback ทั้งหน้า
+    const all = [...document.body.innerText.matchAll(/¥\s*([0-9,]+)/g)].map(m => parseInt(m[1].replace(/,/g,''),10)).filter(v=>v>=1000 && v<=3000000);
+    // ข้ามราคาด้านบนที่เป็น listings (จะอยู่ก่อน 売買履歴) เอาตัวแรกหลัง 売買履歴เท่านั้น
+    return all[0] || null;
+  });
+}
+
+async function clickExactFilter(page, label) {
+  // คลิกปุ่มที่ innerText ตรงเป๊ะ label = "A" หรือ "PSA10"
+  const ok = await page.evaluate((target) => {
+    const btns = [...document.querySelectorAll('button')];
+    // หาปุ่มที่ text ตรงเป๊ะ
+    let found = btns.find(b => b.innerText.trim() === target);
+    if (!found) {
+      // ลองหา span ข้างใน
+      found = btns.find(b => b.innerText.trim().includes(target) && b.innerText.trim().length <= 6);
+      // กรองไม่ให้ A ไปโดน PSA10
+      if (target === 'A') {
+        found = btns.find(b => b.innerText.trim() === 'A');
+      }
     }
-    // fallback: อ่านจาก DOM ของหน้านี้เลย เอาราคาแรกที่เจอในส่วนประวัติ
+    if (found) { found.click(); return true; }
+    return false;
+  }, label);
+  
+  if (!ok) {
+    // fallback locator
     try {
-      const html = document.documentElement.innerHTML;
-      const matches = [...html.matchAll(/¥\s*([0-9,]{3,6})/g)].map(m=>parseInt(m[1].replace(/,/g,''))).filter(v=>v>=1500&&v<=100000);
-      if (matches.length) return { price: matches[0], raw: 'dom' };
-    } catch {}
-    return null;
-  }, { id: apparelId, st: status });
+      await page.locator(`button:has-text("${label}")`).first().click({timeout:3000});
+      return true;
+    } catch { return false; }
+  }
+  await page.waitForTimeout(2500);
+  return true;
 }
 
 async function main() {
   const data = await getPrices();
   const keys = Object.keys(data.prices).sort();
-  const totalBatches = Math.ceil(keys.length / BATCH_SIZE);
-  const now = new Date();
-  const batchIdx = (now.getUTCHours()*4 + Math.floor(now.getUTCMinutes()/15)) % totalBatches;
-  const batch = keys.slice(batchIdx * BATCH_SIZE, batchIdx * BATCH_SIZE + BATCH_SIZE);
-  console.log(`=== BATCH ${batchIdx+1}/${totalBatches}: ${batch.join(', ')} ===`);
+  console.log(`=== RUN ALL ${keys.length} CARDS ===`);
 
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-    locale: 'ja-JP'
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    locale: 'ja-JP', // บังคับญี่ปุ่น ไม่ให้แปลเป็น เอ / พีเอสเอ10
+    extraHTTPHeaders: { 'Accept-Language': 'ja-JP,ja;q=0.9' }
   });
   const page = await context.newPage();
+  
+  // ไปหน้าแรกเพื่อ set cookie
   await page.goto('https://snkrdunk.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await page.waitForTimeout(2000);
+  await page.waitForTimeout(1500);
 
   let updated = 0;
-  for (const k of batch) {
+  for (const k of keys) {
     const item = data.prices[k];
     if (!item?.apparel_id) continue;
 
     try {
-      const id = item.apparel_id;
-      const url = `https://snkrdunk.com/apparels/${id}`;
+      const url = `https://snkrdunk.com/apparels/${item.apparel_id}`;
       console.log(`\n--> ${k} ${url}`);
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-      await page.waitForTimeout(3000);
+      await page.waitForTimeout(3500);
 
-      // RAW A = status A, PSA10 = status PSA10
-      const rawRes = await fetchLatest(page, id, 'A');
-      console.log(`${k} RAW A latest =`, rawRes?.price ?? null);
+      // เลื่อนลงมาที่ 売買履歴
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight*0.6));
+      await page.waitForTimeout(1000);
 
-      const psaRes = await fetchLatest(page, id, 'PSA10');
-      console.log(`${k} PSA10 latest =`, psaRes?.price ?? null);
+      // 1. RAW A = กด A
+      console.log(`${k} clicking A`);
+      await clickExactFilter(page, 'A');
+      const rawPrice = await getLatestPriceFromHistory(page);
+      console.log(`${k} A latest = ${rawPrice}`);
+
+      // 2. PSA10 = กด PSA10
+      console.log(`${k} clicking PSA10`);
+      await clickExactFilter(page, 'PSA10');
+      const psaPrice = await getLatestPriceFromHistory(page);
+      console.log(`${k} PSA10 latest = ${psaPrice}`);
 
       let changed = false;
-      if (rawRes?.price && rawRes.price >= 1500 && rawRes.price <= 100000) {
-        item.raw_jpy = rawRes.price;
-        item.jpy = rawRes.price;
-        item.raw_thb = Math.round(rawRes.price * RATE);
-        item.thb = Math.round(rawRes.price * RATE);
+      if (rawPrice && rawPrice >= 1000) {
+        item.raw_jpy = rawPrice; item.jpy = rawPrice;
+        item.raw_thb = Math.round(rawPrice * RATE);
+        item.thb = Math.round(rawPrice * RATE);
         changed = true;
       }
-      if (psaRes?.price && psaRes.price >= 1500 && psaRes.price <= 200000) {
-        item.psa10_jpy = psaRes.price;
-        item.psa10_thb = Math.round(psaRes.price * RATE);
-        item.psa_jpy = psaRes.price;
-        item.psa_thb = Math.round(psaRes.price * RATE);
+      if (psaPrice && psaPrice >= 1000) {
+        item.psa10_jpy = psaPrice; item.psa_jpy = psaPrice;
+        item.psa10_thb = Math.round(psaPrice * RATE);
+        item.psa_thb = Math.round(psaPrice * RATE);
         changed = true;
       }
 
@@ -118,9 +136,8 @@ async function main() {
         item.updated = new Date().toISOString();
         updated++;
         console.log(`✅ ${k} UPDATED RAW ¥${item.raw_jpy} PSA ¥${item.psa10_jpy}`);
-      } else {
-        console.log(`⚠️ ${k} no valid price (RAW:${rawRes?.price} PSA:${psaRes?.price})`);
       }
+
     } catch (e) {
       console.log(`❌ ${k} error ${e.message}`);
     }
@@ -128,11 +145,7 @@ async function main() {
   }
 
   await browser.close();
-  if (updated > 0) {
-    await putPrices(data);
-    console.log(`🎉 Done ${updated} items`);
-  } else {
-    console.log('No update - keeping old prices');
-  }
+  if (updated > 0) await putPrices(data);
+  console.log(`🎉 Done updated ${updated}/${keys.length}`);
 }
 main();
