@@ -1,4 +1,4 @@
-// scraper.js V5.1 FAST - เร็วขึ้น 2 นาที, ยังดึงจาก DOM จริง
+// scraper.js V6 - 1 ID ดึง 2 ราคา (เอ=RAW A และ พีเอสเอ10=PSA10) แบบราคาล่าสุดแถวแรก
 import { chromium } from 'playwright';
 import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 
@@ -10,7 +10,7 @@ const R2 = new S3Client({
 const BUCKET = process.env.R2_BUCKET || 'cardmatem-raw';
 const FILE_KEY = 'boa-prices.json';
 const RATE = 0.245;
-const BATCH_SIZE = 5;
+const BATCH_SIZE = 4;
 
 async function getPrices() {
   const res = await R2.send(new GetObjectCommand({ Bucket: BUCKET, Key: FILE_KEY }));
@@ -19,19 +19,54 @@ async function getPrices() {
 async function putPrices(data) {
   data.updated = new Date().toISOString();
   await R2.send(new PutObjectCommand({ Bucket: BUCKET, Key: FILE_KEY, Body: JSON.stringify(data,null,2), ContentType: 'application/json' }));
-  console.log('✅ Uploaded:', data.updated);
+  console.log('✅ Uploaded R2', data.updated);
 }
 
-async function getPrice(page) {
+async function getFirstRowPrice(page) {
   await page.waitForTimeout(2500);
   return await page.evaluate(() => {
-    const txt = document.body.innerText;
-    const matches = [...txt.matchAll(/¥\s*([0-9,]{3,6})/g)];
-    const nums = matches.map(m => parseInt(m[1].replace(/,/g,''),10)).filter(v=>v>=1500 && v<=200000);
-    if (nums.length === 0) return null;
-    // เอา 8 อันแรก หาต่ำสุด
-    return Math.min(...nums.slice(0,8));
+    // หาแถวแรกของตารางประวัติการซื้อขาย
+    // ลองหลายวิธี
+    const bodyText = document.body.innerText;
+    // วิธีที่ 1: หาตารางแล้วเอาแถวแรก
+    const rows = document.querySelectorAll('table tr, [class*="history"] [class*="row"], [class*="SalesHistory"] > div');
+    // วิธีที่ง่ายสุด: เอา ¥ ตัวแรกที่เจอในส่วนประวัติการซื้อขาย (อยู่ล่างๆของหน้า)
+    // เพราะในรูป ประวัติจะอยู่ใต้ปุ่มฟิลเตอร์
+    const historySection = document.body.innerHTML;
+    // หา pattern วันที่ + ราคา
+    const priceMatches = [...bodyText.matchAll(/([0-9,]{3,6})\s*เยน/g)].map(m => parseInt(m[1].replace(/,/g,''),10)).filter(v=>v>=1500 && v<=100000);
+    
+    // เอา 4 อันแรกที่เจอในส่วนประวัติ (หลังคำว่า ประวัติการซื้อขาย)
+    const idx = bodyText.indexOf('ประวัติการซื้อขาย');
+    if (idx !== -1) {
+      const afterHistory = bodyText.slice(idx);
+      const m = [...afterHistory.matchAll(/([0-9,]{3,6})\s*เยน/g)].map(x=>parseInt(x[1].replace(/,/g,''),10)).filter(v=>v>=1500 && v<=100000);
+      if (m.length) return m[0]; // ตัวแรก = ล่าสุด
+    }
+    if (priceMatches.length) return priceMatches[0];
+    return null;
   });
+}
+
+async function clickFilter(page, text) {
+  try {
+    // หาปุ่มที่มีข้อความนั้น
+    const btn = page.locator(`button:has-text("${text}")`).first();
+    await btn.click({ timeout: 5000 });
+    await page.waitForTimeout(2000);
+    return true;
+  } catch {
+    // ลองอีกแบบ
+    try {
+      await page.evaluate((t) => {
+        const btns = [...document.querySelectorAll('button')];
+        const found = btns.find(b => b.innerText.includes(t));
+        if (found) found.click();
+      }, text);
+      await page.waitForTimeout(2000);
+      return true;
+    } catch { return false; }
+  }
 }
 
 async function main() {
@@ -39,16 +74,14 @@ async function main() {
   const keys = Object.keys(data.prices).sort();
   const totalBatches = Math.ceil(keys.length / BATCH_SIZE);
   const now = new Date();
-  // วน batch ตามชั่วโมง+นาที/15 จะได้ครบเร็ว
   const batchIdx = (now.getUTCHours()*4 + Math.floor(now.getUTCMinutes()/15)) % totalBatches;
   const batch = keys.slice(batchIdx * BATCH_SIZE, batchIdx * BATCH_SIZE + BATCH_SIZE);
-  
-  console.log(`BATCH ${batchIdx+1}/${totalBatches}: ${batch.join(', ')} - ${new Date().toISOString()}`);
+  console.log(`=== BATCH ${batchIdx+1}/${totalBatches}: ${batch.join(', ')} ===`);
 
-  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox','--disable-blink-features=AutomationControlled'] });
+  const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-    locale: 'ja-JP'
+    userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
+    locale: 'th-TH'
   });
   const page = await context.newPage();
   
@@ -59,56 +92,69 @@ async function main() {
   for (const k of batch) {
     const item = data.prices[k];
     if (!item?.apparel_id) continue;
-    if (k === 'BOA-02' && item.raw_jpy === 6000) { console.log(`${k} locked skip`); continue; }
+    if (k === 'BOA-02' && item.raw_jpy === 6000 && item.psa10_jpy === 12900) {
+      console.log(`${k} locked skip (already correct)`);
+      continue;
+    }
 
     try {
-      const url = `https://snkrdunk.com/apparels/${item.apparel_id}/sales-histories`;
-      console.log(`-> ${k} ${url}`);
+      const url = `https://snkrdunk.com/apparels/${item.apparel_id}`;
+      console.log(`\n--> ${k} ${url}`);
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-      await page.waitForTimeout(3000);
+      await page.waitForTimeout(4000);
 
-      let price = await getPrice(page);
-      console.log(`${k} scraped=${price} old=${item.raw_jpy}`);
+      // เลื่อนลงมาที่ประวัติการซื้อขาย
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight*0.5));
+      await page.waitForTimeout(1000);
 
-      if (!price || price===1000 || price===3000 || price<1500) {
-        console.log(`${k} skip invalid`);
-        continue;
+      // 1. ดึง RAW A - กดฟิลเตอร์ เอ
+      console.log(`${k} clicking เอ (RAW A)`);
+      await clickFilter(page, 'เอ');
+      const rawPrice = await getFirstRowPrice(page);
+      console.log(`${k} RAW A latest = ${rawPrice}`);
+
+      // 2. ดึง PSA10 - กดฟิลเตอร์ พีเอสเอ10
+      console.log(`${k} clicking พีเอสเอ10`);
+      await clickFilter(page, 'พีเอสเอ10');
+      const psaPrice = await getFirstRowPrice(page);
+      console.log(`${k} PSA10 latest = ${psaPrice}`);
+
+      let changed = false;
+      if (rawPrice && rawPrice >= 1500 && rawPrice !== 1000) {
+        item.raw_jpy = rawPrice;
+        item.jpy = rawPrice;
+        item.raw_thb = Math.round(rawPrice * RATE);
+        item.thb = Math.round(rawPrice * RATE);
+        changed = true;
       }
-      // กันราคากระโดดเกิน 2.5 เท่า
-      if (item.raw_jpy > 1500 && item.raw_jpy !== 3000) {
-        if (price > item.raw_jpy * 2.8 || price < item.raw_jpy * 0.35) {
-          console.log(`${k} skip jump ${item.raw_jpy}->${price}`);
-          continue;
-        }
+      if (psaPrice && psaPrice >= 1500 && psaPrice !== 3000) {
+        item.psa10_jpy = psaPrice;
+        item.psa10_thb = Math.round(psaPrice * RATE);
+        item.psa_jpy = psaPrice;
+        item.psa_thb = Math.round(psaPrice * RATE);
+        changed = true;
       }
 
-      item.raw_jpy = price;
-      item.jpy = price;
-      item.raw_thb = Math.round(price * RATE);
-      item.thb = Math.round(price * RATE);
+      if (changed) {
+        item.updated = new Date().toISOString();
+        updated++;
+        console.log(`✅ ${k} UPDATED RAW ¥${item.raw_jpy} PSA ¥${item.psa10_jpy}`);
+      } else {
+        console.log(`⚠️ ${k} no valid price (RAW:${rawPrice} PSA:${psaPrice})`);
+      }
 
-      // PSA10 = RAW * 2.15 ถ้าไม่มี id แยก
-      const ratio = (item.psa10_jpy && item.psa10_jpy !== 3000) ? (item.psa10_jpy / (item.raw_jpy||price)) : 2.15;
-      const useRatio = (ratio>=1.4 && ratio<=4) ? ratio : 2.15;
-      item.psa10_jpy = Math.round(price * useRatio);
-      item.psa10_thb = Math.round(item.psa10_jpy * RATE);
-      item.psa_jpy = item.psa10_jpy;
-      item.psa_thb = item.psa10_thb;
-      item.updated = new Date().toISOString();
-      updated++;
-      console.log(`✅ ${k} UPDATED RAW ¥${price} PSA ¥${item.psa10_jpy}`);
     } catch (e) {
-      console.log(`❌ ${k} ${e.message}`);
+      console.log(`❌ ${k} error ${e.message}`);
     }
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(2000);
   }
 
   await browser.close();
-  if (updated>0) {
+  if (updated > 0) {
     await putPrices(data);
-    console.log(`🎉 Updated ${updated} items`);
+    console.log(`🎉 Done updated ${updated} items`);
   } else {
-    console.log('No update - will keep old prices');
+    console.log('No update - keeping old prices');
   }
 }
 main();
