@@ -1,4 +1,4 @@
-// scraper.js V13 FINAL - แก้ null 100% - อ่านตาราง sales-histories จริงแล้วแยก A / PSA10 เอง
+// scraper.js V14 FINAL FIX - แก้ Timeout + null
 import { chromium } from 'playwright';
 import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 
@@ -22,69 +22,65 @@ async function putPrices(data) {
   console.log('✅ Uploaded', data.updated);
 }
 
-async function scrapeSalesHistories(page, apparelId) {
+async function scrapeOne(page, apparelId) {
   const url = `https://snkrdunk.com/apparels/${apparelId}/sales-histories`;
-  console.log(`  Goto ${url}`);
-  await page.goto(url, { waitUntil: 'networkidle', timeout: 90000 });
-  await page.waitForTimeout(5000);
+  console.log(`Goto ${url}`);
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(8000); // รอให้ JS โหลดประวัติ
 
   const result = await page.evaluate(() => {
-    const rows = [...document.querySelectorAll('table tbody tr')];
+    const text = document.body.innerText;
+    // ดูตารางทั้งหมด
+    const rows = [...document.querySelectorAll('tr')];
+    const debugRows = rows.slice(0,10).map(r=>r.innerText.substring(0,150));
+
     let aPrice = null, psaPrice = null;
-    let aDate = '', psaDate = '';
+    
+    // วิธีใหม่: หาเลขราคา + คำว่า A / PSA จากทั้งหน้า
+    // จาก screenshot ที่คุณส่ง: "เอ 4,400 เยน" "พีเอสเอ10 14,400 เยน"
+    const lines = text.split('\n');
+    for (const line of lines) {
+      const priceMatch = line.match(/([\d,]{3,})\s*เยน|¥\s*([\d,]+)/);
+      if (!priceMatch) continue;
+      let priceStr = (priceMatch[1]||priceMatch[2]||'').replace(/,/g,'');
+      let price = parseInt(priceStr);
+      if (!(price >= 300 && price <= 10000000)) continue;
 
-    for (const tr of rows) {
-      const tds = [...tr.querySelectorAll('td')];
-      if (tds.length < 3) continue;
-      const fullText = tr.innerText;
-
-      // หาราคาในแถว
-      const priceMatch = fullText.match(/([\d,]+)\s*เยน|¥\s*([\d,]+)|([\d,]+)\s*円/);
-      let price = null;
-      if (priceMatch) {
-        const v = (priceMatch[1]||priceMatch[2]||priceMatch[3]||'').replace(/,/g,'');
-        price = parseInt(v);
-        if (!(price >= 500 && price <= 5000000)) price = null;
-      }
-      if (!price) continue;
-
-      // สถานะ: ดูคอลัมน์สถานการณ์
-      const isA = /(\bA\b|เอ\s|中古.*エー|สถานะ.*A)/.test(fullText) && !/PSA/i.test(fullText);
-      const isPSA = /PSA\s*10|พีเอสเอ10|PSA10/i.test(fullText);
-
-      // จาก screenshot: สถานการณ์ = เอ หรือ พีเอสเอ10
-      if (isPSA && !psaPrice) {
+      if (!psaPrice && /PSA\s*10|พีเอสเอ\s*10|PSA10/i.test(line)) {
         psaPrice = price;
-        psaDate = tds[0]?.innerText || '';
       }
-      if (isA && !aPrice) {
+      if (!aPrice && (/^\s*เอ\s/.test(line) || / สถานการณ์.*เอ /i.test(line) || (line.includes(' เอ ') && !line.includes('PSA')))) {
         // ต้องไม่ใช่ PSA
-        if (!/PSA/i.test(fullText)) {
-          aPrice = price;
-          aDate = tds[0]?.innerText || '';
-        }
+        if (!/PSA/i.test(line)) aPrice = price;
       }
-      // fallback แบบง่าย ถ้ายังไม่เจอ ใช้คำว่า เอ ตรงๆ
-      if (!aPrice && fullText.includes(' เอ ') && !fullText.includes('PSA')) {
-        if (fullText.includes('เยน')) {
-          aPrice = price;
-          aDate = tds[0]?.innerText || '';
-        }
-      }
-      if (aPrice && psaPrice) break;
     }
 
-    // fallback สุดท้าย: ถ้าหาแยกไม่ได้ ให้เอาราคาแรกที่เจอในหน้า
+    // fallback: ถ้ายังไม่ได้ ให้เอา 2 ราคาแรกที่เจอในตาราง sales
     if (!aPrice || !psaPrice) {
-      const body = document.body.innerText;
-      const all = [...body.matchAll(/([\d,]+)\s*เยน/g)].map(x=>parseInt(x[1].replace(/,/g,''))).filter(v=>v>=500);
-      return { aPrice: aPrice || all[0] || null, psaPrice: psaPrice || all[1] || all[0] || null, aDate, psaDate, rowCount: rows.length };
+      const tablePrices = [];
+      for (const tr of rows) {
+        const m = tr.innerText.match(/([\d,]+)\s*เยน/);
+        if (m) {
+          let p = parseInt(m[1].replace(/,/g,''));
+          if (p>=300) tablePrices.push({ price:p, text:tr.innerText });
+        }
+      }
+      // สมมติแถวแรกคือล่าสุด ถ้ามี PSA ในแถวนั้น
+      for (const item of tablePrices) {
+        if (!psaPrice && /PSA|พีเอสเอ/i.test(item.text)) psaPrice = item.price;
+        if (!aPrice && !/PSA/i.test(item.text)) aPrice = item.price;
+        if (aPrice && psaPrice) break;
+      }
+      if (!aPrice && tablePrices[0]) aPrice = tablePrices[0].price;
+      if (!psaPrice && tablePrices[1]) psaPrice = tablePrices[1].price;
+      if (!psaPrice) psaPrice = aPrice;
     }
 
-    return { aPrice, psaPrice, aDate, psaDate, rowCount: rows.length };
+    return { aPrice, psaPrice, debugRows, bodySnippet: text.substring(0,1000) };
   });
 
-  console.log(`  -> A ¥${result.aPrice} (${result.aDate}) | PSA10 ¥${result.psaPrice} (${result.psaDate}) rows:${result.rowCount}`);
+  console.log(`  -> RESULT A ¥${result.aPrice} | PSA10 ¥${result.psaPrice}`);
+  console.log(`  Debug first rows:`, result.debugRows?.slice(0,2));
   return result;
 }
 
@@ -96,17 +92,20 @@ async function main() {
   console.log(`=== BATCH ${batchIndex} : ${batchKeys.join(',')} ===`);
 
   const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({ locale: 'th-TH', userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 AppleWebKit/537.36' });
+  const context = await browser.newContext({
+    locale: 'th-TH',
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+  });
   const page = await context.newPage();
 
   let updated = 0;
   for (const key of batchKeys) {
     const item = data.prices[key];
     const apparelId = item.apparel_id || item.url?.match(/apparels\/(\d+)/)?.[1];
-    if (!apparelId) { console.log(`SKIP ${key}`); continue; }
+    if (!apparelId) { console.log(`SKIP ${key} no apparel_id`); continue; }
     try {
       console.log(`\n--> ${key} ${apparelId}`);
-      const { aPrice, psaPrice } = await scrapeSalesHistories(page, apparelId);
+      const { aPrice, psaPrice } = await scrapeOne(page, apparelId);
       if (aPrice) {
         item.raw_jpy = aPrice; item.jpy = aPrice;
         item.raw_thb = Math.round(aPrice * RATE);
@@ -120,10 +119,12 @@ async function main() {
       if (aPrice || psaPrice) {
         item.updated = new Date().toISOString();
         updated++;
-        console.log(`✅ ${key} UPDATED`);
+        console.log(`✅ ${key} UPDATED RAW ¥${aPrice} PSA ¥${psaPrice}`);
       }
-    } catch (e) { console.log(`❌ ${key} ${e.message}`); }
-    await page.waitForTimeout(1500);
+    } catch (e) {
+      console.log(`❌ ${key} ${e.message}`);
+    }
+    await page.waitForTimeout(2000);
   }
 
   await browser.close();
