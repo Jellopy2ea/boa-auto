@@ -1,4 +1,4 @@
-// scraper.js V18 - แยก condition_id 18 = RAW A, 23 = PSA10 ถูกต้อง
+// scraper.js V19 LOWEST ASK - เอาราคาขายปัจจุบัน ไม่ใช่ประวัติ
 import { chromium } from 'playwright';
 import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 
@@ -21,48 +21,88 @@ async function putPrices(data) {
   await R2.send(new PutObjectCommand({ Bucket: BUCKET, Key: FILE_KEY, Body: JSON.stringify(data,null,2), ContentType: 'application/json' }));
 }
 
-async function scrapeOne(page, apparelId) {
-  const url = `https://snkrdunk.com/apparels/${apparelId}/sales-histories`;
-  const salesMap = {}; // condition_id -> latest price
+async function scrapeLowest(page, apparelId) {
+  const url = `https://snkrdunk.com/apparels/${apparelId}/`;
+  const map = {}; // condition_id -> lowest price
 
-  page.on('response', async (response) => {
-    const u = response.url();
-    if (u.includes('/sales-history?')) {
-      try {
-        const urlObj = new URL(u);
-        const cond = urlObj.searchParams.get('condition_id') || 'unknown';
-        const json = await response.json().catch(()=>null);
-        if (!json) return;
-        // json อาจเป็น { data: [...] } หรือ [...]
-        const list = json.data || json.sales || json || [];
-        const arr = Array.isArray(list) ? list : (list.data || []);
+  page.on('response', async (res) => {
+    const u = res.url();
+    // ดักทุก API ที่เกี่ยวกับ apparels
+    if (!u.includes(`/apparels/${apparelId}`)) return;
+    if (!u.includes('/v1/')) return;
+    try {
+      const ct = res.headers()['content-type'] || '';
+      if (!ct.includes('json')) return;
+      const json = await res.json().catch(()=>null);
+      if (!json) return;
+      const urlObj = new URL(u);
+      const cond = urlObj.searchParams.get('condition_id') || urlObj.searchParams.get('card_status') || 'unknown';
+
+      // หา lowest price ใน response
+      let price = null;
+      // ลองหลายรูปแบบ
+      if (json.lowest_price) price = json.lowest_price;
+      else if (json.lowestPrice) price = json.lowestPrice;
+      else if (json.data && Array.isArray(json.data) && json.data[0]) {
+        const first = json.data[0];
+        price = first.lowest_price || first.price || first.min_price;
+      }
+      else if (json.minPrice) price = json.minPrice;
+      else if (json.price) price = json.price;
+
+      // บาง API ส่งเป็น { data: { lowest_price: ... } }
+      if (!price && json.data && json.data.lowest_price) price = json.data.lowest_price;
+
+      if (price) {
+        const p = parseInt(price);
+        if (p>=300 && p<=10000000) {
+          console.log(`  CAPTURED ${u} cond=${cond} lowest ¥${p} len ${JSON.stringify(json).length}`);
+          // เก็บราคาถูกสุดต่อ condition
+          if (!map[cond] || p < map[cond]) map[cond] = p;
+        }
+      } else {
+        // ถ้าไม่มี lowest_price แต่มี list ของ sell orders
+        const list = json.data || json.sell_orders || json.sells || [];
+        const arr = Array.isArray(list) ? list : [];
         if (arr.length > 0) {
-          // เอารายการแรก = ล่าสุด
-          const first = arr[0];
-          const price = first.price || first.sold_price || first.transaction_price || first.total_price;
-          if (price) {
-            console.log(`  CAPTURED cond=${cond} latest ¥${price} len ${JSON.stringify(json).length}`);
-            // เก็บเฉพาะถ้ายังไม่มี หรืออัพเดทใหม่
-            if (!salesMap[cond]) salesMap[cond] = parseInt(price);
+          const prices = arr.map(o=>o.price||o.lowest_price).filter(Boolean).map(v=>parseInt(v)).filter(v=>v>=300);
+          if (prices.length > 0) {
+            const min = Math.min(...prices);
+            console.log(`  CAPTURED ${u} cond=${cond} min from list ¥${min} count ${prices.length}`);
+            if (!map[cond] || min < map[cond]) map[cond] = min;
           }
         } else {
-          console.log(`  CAPTURED cond=${cond} empty len ${JSON.stringify(json).length}`);
+          if (JSON.stringify(json).length < 100) {
+            console.log(`  CAPTURED ${u} cond=${cond} empty len ${JSON.stringify(json).length}`);
+          }
         }
-      } catch {}
-    }
+      }
+    } catch {}
   });
 
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForTimeout(12000);
 
-  // สรุป
-  // จากที่ดู: 18=A, 19=B, 20=C, 21=D, 22=PSA? 23=PSA10
-  // ใช้ 18 สำหรับ RAW A, 23 สำหรับ PSA10
-  let aPrice = salesMap['18'] || salesMap['19'] || null;
-  let psaPrice = salesMap['23'] || salesMap['22'] || null;
+  // จากที่เทสมา:
+  // condition_id 18 = PSA10, 19 = RAW A, 23 = RAW A (แล้วแต่การ์ด)
+  // เราจะลองหาทั้งหมดแล้วเลือก
+  // ถ้าเจอ 18 = PSA10, 19 หรือ 23 = RAW A
+  let aPrice = map['19'] || map['23'] || map['18'] || null;
+  let psaPrice = map['18'] || map['22'] || map['23'] || null;
 
-  // ถ้าไม่มี 23 ลองดู 22
-  console.log(`  MAP ${JSON.stringify(salesMap)} -> A ¥${aPrice} | PSA10 ¥${psaPrice}`);
+  // ถ้าได้อันเดียวกัน ให้แยกกัน: ถ้า 18 มีค่า ให้ลองใช้ 18 เป็น PSA10 และ 23 เป็น A
+  // ดูจาก log เดิม: BOA-01 cond 18 มีขาย, cond 20 ว่าง
+  // เราจะใช้ heuristic: ราคา PSA10 ต้อง >= RAW A ถ้าได้มาแล้ว PSA10 < RAW ให้สลับ
+  if (aPrice && psaPrice && psaPrice < aPrice) {
+    // สลับให้ PSA10 แพงกว่า
+    const tmp = aPrice;
+    aPrice = Math.min(aPrice, psaPrice);
+    psaPrice = Math.max(tmp, psaPrice);
+    // ถ้ายังต่ำกว่า ให้ PSA10 = RAW + 20%
+    if (psaPrice < aPrice) psaPrice = Math.round(aPrice * 1.2);
+  }
+
+  console.log(`  FINAL MAP ${JSON.stringify(map)} -> A ¥${aPrice} | PSA10 ¥${psaPrice}`);
   return { aPrice, psaPrice };
 }
 
@@ -83,11 +123,11 @@ async function main() {
   for (const key of batchKeys) {
     const item = data.prices[key];
     const apparelId = item.apparel_id || item.url?.match(/apparels\/(\d+)/)?.[1];
-    if (!apparelId) { console.log(`SKIP ${key}`); continue; }
+    if (!apparelId) { console.log(`SKIP ${key} no apparel_id`); continue; }
     console.log(`\n--> ${key} ${apparelId}`);
     const page = await context.newPage();
     try {
-      const { aPrice, psaPrice } = await scrapeOne(page, apparelId);
+      const { aPrice, psaPrice } = await scrapeLowest(page, apparelId);
       if (aPrice) {
         item.raw_jpy = aPrice; item.jpy = aPrice;
         item.raw_thb = Math.round(aPrice * RATE);
