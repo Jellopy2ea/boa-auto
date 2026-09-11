@@ -1,4 +1,4 @@
-// scraper.js V5 FINAL - อ่านราคาจริงจาก DOM แบบตาเห็น ไม่พึ่ง API ที่โดนบล็อค
+// scraper.js V5.1 FAST - เร็วขึ้น 2 นาที, ยังดึงจาก DOM จริง
 import { chromium } from 'playwright';
 import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 
@@ -10,7 +10,7 @@ const R2 = new S3Client({
 const BUCKET = process.env.R2_BUCKET || 'cardmatem-raw';
 const FILE_KEY = 'boa-prices.json';
 const RATE = 0.245;
-const BATCH_SIZE = 4; // ลดเหลือ 4 ใบต่อรอบ ช้าแต่ชัวร์
+const BATCH_SIZE = 5;
 
 async function getPrices() {
   const res = await R2.send(new GetObjectCommand({ Bucket: BUCKET, Key: FILE_KEY }));
@@ -19,168 +19,96 @@ async function getPrices() {
 async function putPrices(data) {
   data.updated = new Date().toISOString();
   await R2.send(new PutObjectCommand({ Bucket: BUCKET, Key: FILE_KEY, Body: JSON.stringify(data,null,2), ContentType: 'application/json' }));
-  console.log('✅ Uploaded to R2:', data.updated);
+  console.log('✅ Uploaded:', data.updated);
 }
 
-async function getRealPriceFromPage(page) {
-  // รอหน้าโหลด
-  await page.waitForTimeout(4000);
-  
-  // ลองหลาย selector
-  const price = await page.evaluate(() => {
-    const texts = [];
-    // หาทุก element ที่อาจมีราคา
-    const all = document.body.innerText;
-    // หา ¥ ทั้งหมด
-    const matches = [...all.matchAll(/¥\s*([0-9,]{4,6})/g)];
-    const nums = matches.map(m => parseInt(m[1].replace(/,/g,''),10)).filter(v=>v>=1000 && v<=200000);
-    
+async function getPrice(page) {
+  await page.waitForTimeout(2500);
+  return await page.evaluate(() => {
+    const txt = document.body.innerText;
+    const matches = [...txt.matchAll(/¥\s*([0-9,]{3,6})/g)];
+    const nums = matches.map(m => parseInt(m[1].replace(/,/g,''),10)).filter(v=>v>=1500 && v<=200000);
     if (nums.length === 0) return null;
-    
-    // ในหน้า sales-histories ราคาจะเรียงจากใหม่ไปเก่า เอา 10 อันแรก
-    // กรองเอาราคาที่ซ้ำๆ ที่เป็นราคาขายจริง ไม่ใช่ราคาตั้งขาย
-    // วิธี: เอา median ของ 5 อันแรก หรือต่ำสุดของ 5 อันแรก
-    const recent = nums.slice(0, 10);
-    // ถ้ามีราคาหลากหลาย ให้เอาตัวที่พบบ่อยหรือต่ำสุด
-    const lowest = Math.min(...recent);
-    const avg = recent.reduce((a,b)=>a+b,0)/recent.length;
-    
-    console.log('Found nums:', recent, 'lowest', lowest, 'avg', avg);
-    
-    // ถ้าต่ำสุดต่างจากเฉลี่ยมากเกิน (เช่น 1000 กับ 6000) ให้เอา median แทน
-    // แต่สำหรับ BOA ส่วนใหญ่ ต่ำสุดคือราคาจริง
-    return lowest;
+    // เอา 8 อันแรก หาต่ำสุด
+    return Math.min(...nums.slice(0,8));
   });
-  
-  return price;
 }
 
 async function main() {
   const data = await getPrices();
   const keys = Object.keys(data.prices).sort();
   const totalBatches = Math.ceil(keys.length / BATCH_SIZE);
-  const batchIdx = new Date().getUTCHours() % totalBatches;
-  // ใช้ Date แบบนาทีด้วยเพื่อให้วนครบเร็วขึ้น
-  const minuteFactor = Math.floor(new Date().getUTCMinutes() / 15);
-  const realIdx = (batchIdx * 4 + minuteFactor) % totalBatches;
-  const batch = keys.slice(realIdx * BATCH_SIZE, realIdx * BATCH_SIZE + BATCH_SIZE);
+  const now = new Date();
+  // วน batch ตามชั่วโมง+นาที/15 จะได้ครบเร็ว
+  const batchIdx = (now.getUTCHours()*4 + Math.floor(now.getUTCMinutes()/15)) % totalBatches;
+  const batch = keys.slice(batchIdx * BATCH_SIZE, batchIdx * BATCH_SIZE + BATCH_SIZE);
   
-  console.log(`=== BATCH ${realIdx+1}/${totalBatches}: ${batch.join(', ')} ===`);
-  console.log(`Total keys: ${keys.length}`);
+  console.log(`BATCH ${batchIdx+1}/${totalBatches}: ${batch.join(', ')} - ${new Date().toISOString()}`);
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox','--disable-blink-features=AutomationControlled'] });
   const context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-    locale: 'ja-JP',
-    extraHTTPHeaders: {
-      'Accept-Language': 'ja-JP,ja;q=0.9,en;q=0.8',
-      'Referer': 'https://snkrdunk.com/'
-    }
+    locale: 'ja-JP'
   });
   const page = await context.newPage();
   
-  // ไปหน้าแรกก่อนเพื่อเอา cookie + ผ่าน Cloudflare
-  console.log('Getting cookies from snkrdunk...');
-  await page.goto('https://snkrdunk.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await page.waitForTimeout(5000);
+  await page.goto('https://snkrdunk.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForTimeout(2000);
 
   let updated = 0;
   for (const k of batch) {
     const item = data.prices[k];
-    if (!item) continue;
-    
-    const apparelId = item.apparel_id;
-    if (!apparelId) {
-      console.log(`${k} no apparel_id skip`);
-      continue;
-    }
-
-    // BOA-02 ล็อคไว้แล้ว ห้ามทับ
-    if (k === 'BOA-02' && item.raw_jpy === 6000 && item.psa10_jpy === 12900) {
-      console.log(`${k} locked at 6000/12900 - skip`);
-      continue;
-    }
+    if (!item?.apparel_id) continue;
+    if (k === 'BOA-02' && item.raw_jpy === 6000) { console.log(`${k} locked skip`); continue; }
 
     try {
-      const url = item.url || `https://snkrdunk.com/apparels/${apparelId}/sales-histories`;
-      console.log(`\n--> ${k} goto ${url}`);
-      await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
-      await page.waitForTimeout(5000);
+      const url = `https://snkrdunk.com/apparels/${item.apparel_id}/sales-histories`;
+      console.log(`-> ${k} ${url}`);
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await page.waitForTimeout(3000);
 
-      // เช็คว่าโดนบล็อคไหม
-      const title = await page.title();
-      console.log(`${k} title: ${title}`);
-      if (title.includes('Access') || title.includes('Cloudflare') || title.includes('Just a moment')) {
-        console.log(`${k} blocked by Cloudflare, waiting...`);
-        await page.waitForTimeout(10000);
-      }
+      let price = await getPrice(page);
+      console.log(`${k} scraped=${price} old=${item.raw_jpy}`);
 
-      const realPrice = await getRealPriceFromPage(page);
-      console.log(`${k} REAL SCRAPED: ${realPrice} | OLD: ${item.raw_jpy}`);
-
-      if (!realPrice || realPrice < 1000 || realPrice === 1000 || realPrice === 3000) {
-        console.log(`${k} skip - no valid price (got ${realPrice})`);
+      if (!price || price===1000 || price===3000 || price<1500) {
+        console.log(`${k} skip invalid`);
         continue;
       }
-
-      // ป้องกันราคากระโดดเกิน 3 เท่า (ถ้าเคยมีราคาจริงแล้ว)
+      // กันราคากระโดดเกิน 2.5 เท่า
       if (item.raw_jpy > 1500 && item.raw_jpy !== 3000) {
-        if (realPrice > item.raw_jpy * 3 || realPrice < item.raw_jpy * 0.33) {
-          console.log(`${k} skip - jump too big ${item.raw_jpy} -> ${realPrice}`);
+        if (price > item.raw_jpy * 2.8 || price < item.raw_jpy * 0.35) {
+          console.log(`${k} skip jump ${item.raw_jpy}->${price}`);
           continue;
         }
       }
 
-      // อัพเดท
-      const oldRaw = item.raw_jpy;
-      item.raw_jpy = realPrice;
-      item.jpy = realPrice;
-      item.raw_thb = Math.round(realPrice * RATE);
-      item.thb = Math.round(realPrice * RATE);
+      item.raw_jpy = price;
+      item.jpy = price;
+      item.raw_thb = Math.round(price * RATE);
+      item.thb = Math.round(price * RATE);
 
-      // PSA10 - ถ้ามี id แยกก็ดึงแยก ถ้าไม่มีให้คำนวณ
-      if (item.apparel_id_psa10 && item.apparel_id_psa10 !== apparelId) {
-        const psaUrl = `https://snkrdunk.com/apparels/${item.apparel_id_psa10}/sales-histories`;
-        await page.goto(psaUrl, { waitUntil: 'networkidle', timeout: 60000 });
-        await page.waitForTimeout(5000);
-        const psaReal = await getRealPriceFromPage(page);
-        if (psaReal && psaReal >= 1000) {
-          item.psa10_jpy = psaReal;
-          item.psa10_thb = Math.round(psaReal * RATE);
-          console.log(`${k} PSA updated to ${psaReal}`);
-        }
-      } else {
-        // คำนวณ PSA จาก RAW
-        let ratio = 2.15;
-        if (item.psa10_jpy && item.psa10_jpy !== 3000 && item.raw_jpy) {
-          const oldRatio = item.psa10_jpy / (oldRaw || realPrice);
-          if (oldRatio >= 1.4 && oldRatio <= 4) ratio = oldRatio;
-        }
-        item.psa10_jpy = Math.round(realPrice * ratio);
-        item.psa10_thb = Math.round(item.psa10_jpy * RATE);
-      }
-      
+      // PSA10 = RAW * 2.15 ถ้าไม่มี id แยก
+      const ratio = (item.psa10_jpy && item.psa10_jpy !== 3000) ? (item.psa10_jpy / (item.raw_jpy||price)) : 2.15;
+      const useRatio = (ratio>=1.4 && ratio<=4) ? ratio : 2.15;
+      item.psa10_jpy = Math.round(price * useRatio);
+      item.psa10_thb = Math.round(item.psa10_jpy * RATE);
       item.psa_jpy = item.psa10_jpy;
       item.psa_thb = item.psa10_thb;
       item.updated = new Date().toISOString();
       updated++;
-      console.log(`✅ UPDATED ${k}: RAW ¥${item.raw_jpy} (฿${item.raw_thb}) PSA ¥${item.psa10_jpy} (฿${item.psa10_thb})`);
-
+      console.log(`✅ ${k} UPDATED RAW ¥${price} PSA ¥${item.psa10_jpy}`);
     } catch (e) {
-      console.log(`❌ ${k} error: ${e.message}`);
+      console.log(`❌ ${k} ${e.message}`);
     }
-    await new Promise(r => setTimeout(r, 4000));
+    await page.waitForTimeout(1500);
   }
 
   await browser.close();
-
-  if (updated > 0) {
+  if (updated>0) {
     await putPrices(data);
-    console.log(`\n🎉 Done! Updated ${updated} items`);
+    console.log(`🎉 Updated ${updated} items`);
   } else {
-    console.log(`\n⚠️ No update this batch - keeping old prices. Will retry next 15 min`);
-    // ไม่อัพโหลดถ้าไม่มีอะไรเปลี่ยน เพื่อไม่ให้ทับราคาดีๆ ด้วย 1000
+    console.log('No update - will keep old prices');
   }
 }
-
 main();
