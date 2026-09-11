@@ -1,4 +1,4 @@
-// scraper.js V17 PLAYWRIGHT INTERCEPT - ดัก API ที่ SNKRDUNK ยิงเอง
+// scraper.js V21 - อ่านราคาขายล่าสุดจากหน้า sales-histories ตรงๆ
 import { chromium } from 'playwright';
 import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 
@@ -22,122 +22,98 @@ async function putPrices(data) {
   console.log('✅ Uploaded to R2');
 }
 
-async function scrapeWithIntercept(page, apparelId) {
+async function scrapeSalesHistory(page, apparelId) {
   const url = `https://snkrdunk.com/apparels/${apparelId}/sales-histories`;
-  console.log(`\n--> Goto ${url}`);
-
-  let captured = [];
+  console.log(`--> ${url}`);
   
-  // ดักทุก response ที่มีคำว่า sales / transaction / history
-  page.on('response', async (response) => {
-    const u = response.url();
-    if (u.includes('sales') || u.includes('transaction') || u.includes('history') || u.includes('_next/data')) {
-      try {
-        const ct = response.headers()['content-type'] || '';
-        if (ct.includes('json') || u.includes('.json')) {
-          const json = await response.json().catch(()=>null);
-          if (json) {
-            const s = JSON.stringify(json).substring(0,2000);
-            if (s.includes('price') || s.includes('เยน') || s.includes('sold')) {
-              console.log(`  CAPTURED API ${u} len ${JSON.stringify(json).length}`);
-              captured.push(json);
-            }
+  const salesByCond = {};
+
+  page.on('response', async (res) => {
+    const u = res.url();
+    if (!u.includes(`/apparels/${apparelId}`)) return;
+    if (!u.includes('sales-history')) return;
+    if (!u.includes('/v1/')) return;
+    try {
+      const ct = res.headers()['content-type'] || '';
+      if (!ct.includes('json')) return;
+      const json = await res.json().catch(()=>null);
+      if (!json) return;
+      
+      const urlObj = new URL(u);
+      const condId = urlObj.searchParams.get('condition_id') || 'all';
+      const list = json.data || json.sales_histories || json || [];
+      const arr = Array.isArray(list) ? list : (list.data || []);
+      
+      if (arr.length > 0) {
+        const latest = arr[0];
+        const price = latest.price || latest.sold_price || latest.transaction_price;
+        const condLabel = latest.condition || latest.card_condition || latest.status || condId;
+        console.log(`  CAPTURED sales-history cond=${condId} label=${condLabel} latest ¥${price} count=${arr.length} len=${JSON.stringify(json).length}`);
+        if (price) {
+          const p = parseInt(price);
+          if (p>=300) {
+            salesByCond[condId] = { price: p, label: condLabel, raw: latest };
           }
         }
-      } catch {}
-    }
+      } else {
+        console.log(`  CAPTURED cond=${condId} empty len=${JSON.stringify(json).length}`);
+      }
+    } catch {}
   });
 
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await page.waitForTimeout(10000); // รอให้ JS ยิง API
+  await page.waitForTimeout(12000);
 
-  // 1. ลองหาจาก API ที่ดักได้
+  // อ่านจาก DOM ด้วย เผื่อ API โดนบล็อค
+  const domPrices = await page.evaluate(() => {
+    const rows = [...document.querySelectorAll('table tbody tr')];
+    const result = [];
+    for (const tr of rows.slice(0,10)) {
+      const text = tr.innerText;
+      const priceMatch = text.match(/([\d,]+)/);
+      if (priceMatch) {
+        result.push({ text: text.substring(0,100), price: parseInt(priceMatch[1].replace(/,/g,'')) });
+      }
+    }
+    return result;
+  });
+  console.log(`  DOM first rows: ${JSON.stringify(domPrices.slice(0,3))}`);
+
+  // หา A และ PSA10 จาก salesByCond
+  // SNKRDUNK trading card: condition_id 18=A, 19=B, 20=C, 22=PSA10?, 23=PSA10?
+  // เราจะดูจาก label ถ้ามี
   let aPrice = null, psaPrice = null;
   
-  for (const data of captured) {
-    const str = JSON.stringify(data);
-    // หา price ทั้งหมด
-    const prices = [...str.matchAll(/"price"\s*:\s*(\d+)/g)].map(x=>parseInt(x[1])).filter(v=>v>=300 && v<=10000000);
-    if (prices.length > 0) {
-      console.log(`  API prices sample ${prices.slice(0,5)}`);
-      // ลองหาแบบมี status
-      const regex = /"status"\s*:\s*"([^"]+)"[^}]{0,100}"price"\s*:\s*(\d+)/gi;
-      let m;
-      while ((m = regex.exec(str)) !== null) {
-        const status = m[1].toLowerCase();
-        const price = parseInt(m[2]);
-        if (status.includes('psa') && !psaPrice) psaPrice = price;
-        if ((status === 'a' || status === 'เอ' || status.includes('a')) && !status.includes('psa') && !aPrice) aPrice = price;
+  for (const [condId, data] of Object.entries(salesByCond)) {
+    const label = (data.label || '').toString().toUpperCase();
+    if (label.includes('PSA10') || label.includes('PSA 10') || condId === '23' || condId === '22') {
+      if (!psaPrice || data.price > psaPrice) {
+        // เลือก cond 23 ก่อน ถ้ามี
+        if (condId === '23' || label.includes('PSA10')) {
+          psaPrice = data.price;
+        } else if (!psaPrice) {
+          psaPrice = data.price;
+        }
       }
-      // fallback ถ้ายังไม่ได้
-      if (!aPrice && prices[0]) aPrice = prices[0];
-      if (!psaPrice && prices[1]) psaPrice = prices[1];
-      if (aPrice || psaPrice) break;
+    }
+    if (label === 'A' || label.includes(' A ') || condId === '18' || condId === '19') {
+      if (!aPrice) aPrice = data.price;
+      if (condId === '18') aPrice = data.price; // 18 = A หลัก
     }
   }
 
-  // 2. ถ้ายังไม่ได้ อ่านจาก DOM ตรงๆ แบบที่เห็นใน screenshot คุณ
-  if (!aPrice || !psaPrice) {
-    const domResult = await page.evaluate(() => {
-      const bodyText = document.body.innerText;
-      const lines = bodyText.split('\n').map(l=>l.trim()).filter(Boolean);
-      let a = null, psa = null;
-      const debug = [];
-      
-      for (let i=0; i<lines.length; i++) {
-        const line = lines[i];
-        // ตัวอย่างจริงจาก SNKRDUNK: "เอ 4,400 เยน" / "พีเอสเอ10 14,400 เยน"
-        if (line.includes('เยน')) {
-          const priceMatch = line.match(/([\d,]+)\s*เยน/);
-          if (!priceMatch) continue;
-          const p = parseInt(priceMatch[1].replace(/,/g,''));
-          if (!(p>=300 && p<=5000000)) continue;
-          
-          debug.push(line);
-          
-          if (line.includes('PSA') || line.includes('พีเอสเอ') || line.includes('PSA10')) {
-            if (!psa) psa = p;
-          } else if (line.includes(' เอ ') || line.startsWith('เอ ') || line.includes(' สถานะ A') || (!line.includes('PSA') && p)) {
-            // ถ้าบรรทัดมีคำว่า เอ และไม่มี PSA
-            if (line.includes('เอ') && !line.includes('PSA')) {
-              if (!a) a = p;
-            }
-          }
-        }
-      }
-      
-      // ถ้ายังไม่ได้ ให้เอา 2 ราคาแรกที่เจอในตาราง
-      if (!a || !psa) {
-        const tableRows = [...document.querySelectorAll('table tr')];
-        const tablePrices = [];
-        for (const tr of tableRows) {
-          const txt = tr.innerText;
-          if (txt.includes('เยน')) {
-            const mm = txt.match(/([\d,]+)\s*เยน/);
-            if (mm) {
-              const pp = parseInt(mm[1].replace(/,/g,''));
-              tablePrices.push({ price: pp, text: txt });
-            }
-          }
-        }
-        // เรียงจากบนลงล่างคือล่าสุดก่อน
-        if (tablePrices.length >= 1 && !a) a = tablePrices.find(t=>!t.text.includes('PSA'))?.price || tablePrices[0].price;
-        if (tablePrices.length >= 1 && !psa) psa = tablePrices.find(t=>t.text.includes('PSA'))?.price || tablePrices[1]?.price || a;
-      }
-      
-      return { a, psa, debug: debug.slice(0,5), bodySnippet: bodyText.substring(0,2000) };
-    });
-    
-    console.log(`  DOM debug lines:`, domResult.debug);
-    if (!aPrice) aPrice = domResult.a;
-    if (!psaPrice) psaPrice = domResult.psa;
-    
-    if (!aPrice && !psaPrice) {
-      console.log(`  body snippet: ${domResult.bodySnippet.substring(0,500)}`);
-    }
+  // fallback ถ้ายังไม่ได้ ใช้ cond 18 = A, cond 23 = PSA10 ตามที่เจอจริง
+  if (!aPrice && salesByCond['18']) aPrice = salesByCond['18'].price;
+  if (!aPrice && salesByCond['19']) aPrice = salesByCond['19'].price;
+  if (!psaPrice && salesByCond['23']) psaPrice = salesByCond['23'].price;
+  if (!psaPrice && salesByCond['22']) psaPrice = salesByCond['22'].price;
+
+  // ถ้ายังไม่มี PSA10 ให้ลองดูว่า cond 18 มี PSA10 ไหม (บางการ์ดใช้ cond เดียวกัน)
+  if (!psaPrice && salesByCond['18'] && salesByCond['18'].label && salesByCond['18'].label.toString().toUpperCase().includes('PSA')) {
+    psaPrice = salesByCond['18'].price;
   }
 
-  console.log(`  -> FINAL A ¥${aPrice} | PSA10 ¥${psaPrice}`);
+  console.log(`  FINAL MAP ${JSON.stringify(Object.fromEntries(Object.entries(salesByCond).map(([k,v])=>[k,v.price])))} -> A ¥${aPrice} | PSA10 ¥${psaPrice}`);
   return { aPrice, psaPrice };
 }
 
@@ -150,20 +126,20 @@ async function main() {
 
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
-    locale: 'th-TH',
+    locale: 'ja-JP',
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    extraHTTPHeaders: { 'Accept-Language': 'th-TH,th;q=0.9,ja;q=0.8,en;q=0.7' }
+    extraHTTPHeaders: { 'Accept-Language': 'ja-JP,ja;q=0.9' }
   });
-  
+
   let updated = 0;
   for (const key of batchKeys) {
     const item = data.prices[key];
     const apparelId = item.apparel_id || item.url?.match(/apparels\/(\d+)/)?.[1];
-    if (!apparelId) { console.log(`SKIP ${key} no apparel_id`); continue; }
-    
+    if (!apparelId) { console.log(`SKIP ${key} no apparel_id - need to fix boa-prices.json`); continue; }
+    console.log(`\n--> ${key} ${apparelId}`);
     const page = await context.newPage();
     try {
-      const { aPrice, psaPrice } = await scrapeWithIntercept(page, apparelId);
+      const { aPrice, psaPrice } = await scrapeSalesHistory(page, apparelId);
       if (aPrice) {
         item.raw_jpy = aPrice; item.jpy = aPrice;
         item.raw_thb = Math.round(aPrice * RATE);
@@ -177,19 +153,19 @@ async function main() {
       if (aPrice || psaPrice) {
         item.updated = new Date().toISOString();
         updated++;
-        console.log(`  ✅ ${key} UPDATED RAW ¥${aPrice} PSA10 ¥${psaPrice}`);
+        console.log(`✅ ${key} UPDATED RAW ¥${aPrice} PSA10 ¥${psaPrice}`);
       } else {
-        console.log(`  ❌ ${key} still null`);
+        console.log(`❌ ${key} no sales found`);
       }
     } catch (e) {
-      console.log(`  ❌ ${key} error ${e.message}`);
+      console.log(`❌ ${key} error ${e.message}`);
     }
     await page.close();
-    await new Promise(r=>setTimeout(r, 2000));
+    await new Promise(r=>setTimeout(r,2000));
   }
 
   await browser.close();
   if (updated>0) await putPrices(data);
-  console.log(`\n🎉 DONE ${updated}/${batchKeys.length} - Updated: ${updated}`);
+  console.log(`\n🎉 DONE ${updated}/${batchKeys.length}`);
 }
 main();
