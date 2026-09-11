@@ -1,4 +1,4 @@
-// scraper.js V6 - 1 ID ดึง 2 ราคา (เอ=RAW A และ พีเอสเอ10=PSA10) แบบราคาล่าสุดแถวแรก
+// scraper.js V7 - FIX null - ใช้ API ตรงๆ ไม่กดปุ่ม เอาตัวล่าสุดแบบหุ้น
 import { chromium } from 'playwright';
 import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 
@@ -19,54 +19,46 @@ async function getPrices() {
 async function putPrices(data) {
   data.updated = new Date().toISOString();
   await R2.send(new PutObjectCommand({ Bucket: BUCKET, Key: FILE_KEY, Body: JSON.stringify(data,null,2), ContentType: 'application/json' }));
-  console.log('✅ Uploaded R2', data.updated);
+  console.log('✅ Uploaded', data.updated);
 }
 
-async function getFirstRowPrice(page) {
-  await page.waitForTimeout(2500);
-  return await page.evaluate(() => {
-    // หาแถวแรกของตารางประวัติการซื้อขาย
-    // ลองหลายวิธี
-    const bodyText = document.body.innerText;
-    // วิธีที่ 1: หาตารางแล้วเอาแถวแรก
-    const rows = document.querySelectorAll('table tr, [class*="history"] [class*="row"], [class*="SalesHistory"] > div');
-    // วิธีที่ง่ายสุด: เอา ¥ ตัวแรกที่เจอในส่วนประวัติการซื้อขาย (อยู่ล่างๆของหน้า)
-    // เพราะในรูป ประวัติจะอยู่ใต้ปุ่มฟิลเตอร์
-    const historySection = document.body.innerHTML;
-    // หา pattern วันที่ + ราคา
-    const priceMatches = [...bodyText.matchAll(/([0-9,]{3,6})\s*เยน/g)].map(m => parseInt(m[1].replace(/,/g,''),10)).filter(v=>v>=1500 && v<=100000);
-    
-    // เอา 4 อันแรกที่เจอในส่วนประวัติ (หลังคำว่า ประวัติการซื้อขาย)
-    const idx = bodyText.indexOf('ประวัติการซื้อขาย');
-    if (idx !== -1) {
-      const afterHistory = bodyText.slice(idx);
-      const m = [...afterHistory.matchAll(/([0-9,]{3,6})\s*เยน/g)].map(x=>parseInt(x[1].replace(/,/g,''),10)).filter(v=>v>=1500 && v<=100000);
-      if (m.length) return m[0]; // ตัวแรก = ล่าสุด
+// ดึงราคาล่าสุดโดยใช้ fetch ใน page context (ผ่าน Cloudflare ได้)
+async function fetchLatest(page, apparelId, status) {
+  return await page.evaluate(async ({id, st}) => {
+    // ลองหลาย endpoint ที่ SNKRDUNK ใช้จริง
+    const urls = [
+      `https://snkrdunk.com/api/v1/apparels/${id}/sales?status=${st}&limit=1&sort=sold_at_desc`,
+      `https://snkrdunk.com/api/v1/apparels/${id}/sales_histories?status=${st}&limit=1`,
+      `https://snkrdunk.com/v1/apparels/${id}/sales?status=${st}&per=1`,
+      `https://snkrdunk.com/apparels/${id}/sales-histories?status=${st}`
+    ];
+    for (const url of urls) {
+      try {
+        const res = await fetch(url, { credentials: 'include', headers: { 'Accept': 'application/json' } });
+        const text = await res.text();
+        if (!text) continue;
+        try {
+          const json = JSON.parse(text);
+          // หาราคาใน json
+          if (Array.isArray(json) && json[0]?.price) return { price: json[0].price, raw: json };
+          if (json.data && Array.isArray(json.data) && json.data[0]?.price) return { price: json.data[0].price, raw: json.data };
+          if (json.sales && Array.isArray(json.sales) && json.sales[0]?.price) return { price: json.sales[0].price, raw: json.sales };
+          if (json.price) return { price: json.price, raw: json };
+        } catch {
+          // ถ้าไม่ใช่ json ให้ลองหาด้วย regex ¥
+          const m = text.match(/(\d{3,6})\s*yen/i) || text.match(/¥\s*([0-9,]+)/);
+          if (m) return { price: parseInt(m[1].replace(/,/g,'')), raw: text.slice(0,500) };
+        }
+      } catch {}
     }
-    if (priceMatches.length) return priceMatches[0];
-    return null;
-  });
-}
-
-async function clickFilter(page, text) {
-  try {
-    // หาปุ่มที่มีข้อความนั้น
-    const btn = page.locator(`button:has-text("${text}")`).first();
-    await btn.click({ timeout: 5000 });
-    await page.waitForTimeout(2000);
-    return true;
-  } catch {
-    // ลองอีกแบบ
+    // fallback: อ่านจาก DOM ของหน้านี้เลย เอาราคาแรกที่เจอในส่วนประวัติ
     try {
-      await page.evaluate((t) => {
-        const btns = [...document.querySelectorAll('button')];
-        const found = btns.find(b => b.innerText.includes(t));
-        if (found) found.click();
-      }, text);
-      await page.waitForTimeout(2000);
-      return true;
-    } catch { return false; }
-  }
+      const html = document.documentElement.innerHTML;
+      const matches = [...html.matchAll(/¥\s*([0-9,]{3,6})/g)].map(m=>parseInt(m[1].replace(/,/g,''))).filter(v=>v>=1500&&v<=100000);
+      if (matches.length) return { price: matches[0], raw: 'dom' };
+    } catch {}
+    return null;
+  }, { id: apparelId, st: status });
 }
 
 async function main() {
@@ -80,11 +72,10 @@ async function main() {
 
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
-    locale: 'th-TH'
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+    locale: 'ja-JP'
   });
   const page = await context.newPage();
-  
   await page.goto('https://snkrdunk.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
   await page.waitForTimeout(2000);
 
@@ -92,46 +83,34 @@ async function main() {
   for (const k of batch) {
     const item = data.prices[k];
     if (!item?.apparel_id) continue;
-    if (k === 'BOA-02' && item.raw_jpy === 6000 && item.psa10_jpy === 12900) {
-      console.log(`${k} locked skip (already correct)`);
-      continue;
-    }
 
     try {
-      const url = `https://snkrdunk.com/apparels/${item.apparel_id}`;
+      const id = item.apparel_id;
+      const url = `https://snkrdunk.com/apparels/${id}`;
       console.log(`\n--> ${k} ${url}`);
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-      await page.waitForTimeout(4000);
+      await page.waitForTimeout(3000);
 
-      // เลื่อนลงมาที่ประวัติการซื้อขาย
-      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight*0.5));
-      await page.waitForTimeout(1000);
+      // RAW A = status A, PSA10 = status PSA10
+      const rawRes = await fetchLatest(page, id, 'A');
+      console.log(`${k} RAW A latest =`, rawRes?.price ?? null);
 
-      // 1. ดึง RAW A - กดฟิลเตอร์ เอ
-      console.log(`${k} clicking เอ (RAW A)`);
-      await clickFilter(page, 'เอ');
-      const rawPrice = await getFirstRowPrice(page);
-      console.log(`${k} RAW A latest = ${rawPrice}`);
-
-      // 2. ดึง PSA10 - กดฟิลเตอร์ พีเอสเอ10
-      console.log(`${k} clicking พีเอสเอ10`);
-      await clickFilter(page, 'พีเอสเอ10');
-      const psaPrice = await getFirstRowPrice(page);
-      console.log(`${k} PSA10 latest = ${psaPrice}`);
+      const psaRes = await fetchLatest(page, id, 'PSA10');
+      console.log(`${k} PSA10 latest =`, psaRes?.price ?? null);
 
       let changed = false;
-      if (rawPrice && rawPrice >= 1500 && rawPrice !== 1000) {
-        item.raw_jpy = rawPrice;
-        item.jpy = rawPrice;
-        item.raw_thb = Math.round(rawPrice * RATE);
-        item.thb = Math.round(rawPrice * RATE);
+      if (rawRes?.price && rawRes.price >= 1500 && rawRes.price <= 100000) {
+        item.raw_jpy = rawRes.price;
+        item.jpy = rawRes.price;
+        item.raw_thb = Math.round(rawRes.price * RATE);
+        item.thb = Math.round(rawRes.price * RATE);
         changed = true;
       }
-      if (psaPrice && psaPrice >= 1500 && psaPrice !== 3000) {
-        item.psa10_jpy = psaPrice;
-        item.psa10_thb = Math.round(psaPrice * RATE);
-        item.psa_jpy = psaPrice;
-        item.psa_thb = Math.round(psaPrice * RATE);
+      if (psaRes?.price && psaRes.price >= 1500 && psaRes.price <= 200000) {
+        item.psa10_jpy = psaRes.price;
+        item.psa10_thb = Math.round(psaRes.price * RATE);
+        item.psa_jpy = psaRes.price;
+        item.psa_thb = Math.round(psaRes.price * RATE);
         changed = true;
       }
 
@@ -140,19 +119,18 @@ async function main() {
         updated++;
         console.log(`✅ ${k} UPDATED RAW ¥${item.raw_jpy} PSA ¥${item.psa10_jpy}`);
       } else {
-        console.log(`⚠️ ${k} no valid price (RAW:${rawPrice} PSA:${psaPrice})`);
+        console.log(`⚠️ ${k} no valid price (RAW:${rawRes?.price} PSA:${psaRes?.price})`);
       }
-
     } catch (e) {
       console.log(`❌ ${k} error ${e.message}`);
     }
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(1500);
   }
 
   await browser.close();
   if (updated > 0) {
     await putPrices(data);
-    console.log(`🎉 Done updated ${updated} items`);
+    console.log(`🎉 Done ${updated} items`);
   } else {
     console.log('No update - keeping old prices');
   }
