@@ -1,4 +1,4 @@
-// scraper.js V29 FINAL - Hardcode 1-46 ครบจาก Link_SNKR.txt - 100% AUTO
+// scraper.js V30 BATCH 15 ใบ - รันทุก 15 นาที ครั้งละ 15 ใบ วน 3 รอบครบ 46 ใบ
 import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { chromium } from 'playwright';
 
@@ -11,6 +11,7 @@ const BUCKET = process.env.R2_BUCKET || 'cardmatem-raw';
 const FILE_KEY = 'boa-prices.json';
 const RATE = 0.245;
 
+// Hardcode 46 ใบครบจาก Link_SNKR.txt
 const HARDCODE_MAP = {
   '713690': { productId: '824552', variantId: '9534253', key: 'BOA-01' },
   '714615': { productId: '826001', variantId: '9549494', key: 'BOA-02' },
@@ -66,14 +67,12 @@ async function getPrices() {
 async function putPrices(data) {
   data.updated = new Date().toISOString();
   await R2.send(new PutObjectCommand({ Bucket: BUCKET, Key: FILE_KEY, Body: JSON.stringify(data,null,2), ContentType: 'application/json' }));
-  console.log('✅ Uploaded R2 - 46 ใบครบ');
 }
 
 async function scrapeOne(browser, apparelId) {
   const map = HARDCODE_MAP[apparelId];
   const { productId, variantId, key } = map;
-  console.log(`\n=== ${key} apparel=${apparelId} product=${productId} variant=${variantId} ===`);
-  const context = await browser.newContext({ userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0', locale: 'ja-JP' });
+  const context = await browser.newContext({ userAgent: 'Mozilla/5.0 Chrome/120', locale: 'ja-JP' });
   const page = await context.newPage();
   try {
     await page.goto(`https://snkrdunk.com/apparels/${apparelId}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -83,53 +82,53 @@ async function scrapeOne(browser, apparelId) {
         try {
           const url = `https://snkrdunk.com/v3/products/${productId}/trading-history?range=all&condition_code=${code}&variant_id=${variantId}`;
           const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
-          if (!res.ok) return { price: null, status: res.status };
+          if (!res.ok) return { price: null };
           const json = await res.json();
-          const price = json.trades && json.trades[0] ? json.trades[0].price : null;
-          return { price, count: json.trades?.length || 0, status: res.status };
-        } catch (e) { return { price: null, error: e.message }; }
+          return { price: json.trades?.[0]?.price || null, count: json.trades?.length || 0 };
+        } catch { return { price: null }; }
       };
-      const rawA = await fetchPrice('trading_card_single_nearly_unused');
-      const psa10 = await fetchPrice('trading_card_single_psa10');
-      return { rawA, psa10 };
+      return { rawA: await fetchPrice('trading_card_single_nearly_unused'), psa10: await fetchPrice('trading_card_single_psa10') };
     }, { productId, variantId });
-    console.log(`  RAW A: ¥${prices.rawA.price} (count ${prices.rawA.count}) | PSA10: ¥${prices.psa10.price} (count ${prices.psa10.count})`);
     await context.close();
-    return { rawA: prices.rawA.price, psa10: prices.psa10.price, productId, variantId, key };
-  } catch (e) {
-    console.log(`  ERROR ${key}: ${e.message}`);
+    return { rawA: prices.rawA.price, psa10: prices.psa10.price, productId, variantId, key, countA: prices.rawA.count, countP: prices.psa10.count };
+  } catch {
     await context.close();
     return { rawA: null, psa10: null, productId, variantId, key };
   }
 }
 
 async function main() {
+  const allKeys = Object.keys(HARDCODE_MAP);
+  // BATCH logic: 0=0-14, 1=15-29, 2=30-44
+  const batchIdx = parseInt(process.env.BATCH || '0') % 3;
+  const batchSize = 15;
+  const batchKeys = allKeys.slice(batchIdx * batchSize, batchIdx * batchSize + batchSize);
+  
+  console.log(`=== V30 BATCH ${batchIdx+1}/3 - ${batchKeys.length} ใบ: ${batchKeys.map(k=>HARDCODE_MAP[k].key).join(', ')} ===`);
+  
   const data = await getPrices();
-  console.log(`=== V29 FINAL HARDCODE 46 ใบครบ 100% AUTO ===`);
-  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox','--disable-blink-features=AutomationControlled'] });
+  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
   let updated = 0;
-  for (const apparelId of Object.keys(HARDCODE_MAP)) {
-    const result = await scrapeOne(browser, apparelId);
+  for (const apparelId of batchKeys) {
+    const r = await scrapeOne(browser, apparelId);
     let foundKey = null;
-    for (const k of Object.keys(data.prices)) {
-      if (data.prices[k].apparel_id == apparelId) { foundKey = k; break; }
-    }
-    if (!foundKey) foundKey = result.key;
+    for (const k of Object.keys(data.prices)) if (data.prices[k].apparel_id == apparelId) { foundKey = k; break; }
+    if (!foundKey) foundKey = r.key;
     if (!data.prices[foundKey]) data.prices[foundKey] = { apparel_id: apparelId };
     const item = data.prices[foundKey];
-    if (result.rawA || result.psa10) {
-      if (result.rawA) { item.raw_jpy = result.rawA; item.jpy = result.rawA; item.raw_thb = Math.round(result.rawA * RATE); item.thb = Math.round(result.rawA * RATE); }
-      if (result.psa10) { item.psa10_jpy = result.psa10; item.psa_jpy = result.psa10; item.psa10_thb = Math.round(result.psa10 * RATE); item.psa_thb = Math.round(result.psa10 * RATE); }
-      item.product_id = result.productId; item.variant_id = result.variantId; item.apparel_id = apparelId;
+    if (r.rawA || r.psa10) {
+      if (r.rawA) { item.raw_jpy = r.rawA; item.jpy = r.rawA; item.raw_thb = Math.round(r.rawA * RATE); item.thb = Math.round(r.rawA * RATE); }
+      if (r.psa10) { item.psa10_jpy = r.psa10; item.psa_jpy = r.psa10; item.psa10_thb = Math.round(r.psa10 * RATE); item.psa_thb = Math.round(r.psa10 * RATE); }
+      item.product_id = r.productId; item.variant_id = r.variantId;
       item.updated = new Date().toISOString();
-      item.source = 'V29 FINAL 46 ใบครบ 100% AUTO';
+      item.source = `V30 BATCH ${batchIdx+1}/3`;
       updated++;
-      console.log(`  ✅ ${foundKey} UPDATED THB ${item.thb || '-'} / ${item.psa_thb || '-'}`);
+      console.log(`✅ ${foundKey} ¥${r.rawA||'-'}/${r.psa10||'-'} -> THB ${item.thb||'-'}/${item.psa_thb||'-'}`);
     }
     await new Promise(r=>setTimeout(r,1000));
   }
   await browser.close();
-  if (updated > 0) await putPrices(data);
-  console.log(`\n🎉 V29 DONE ${updated}/45 -> https://cardmatem.store/boa-board - ครบ 46 ใบ BOA-04 ว่างตามไฟล์`);
+  if (updated>0) await putPrices(data);
+  console.log(`🎉 BATCH ${batchIdx+1}/3 DONE ${updated}/${batchKeys.length}`);
 }
 main();
