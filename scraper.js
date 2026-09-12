@@ -1,4 +1,5 @@
-// scraper.js V30 BATCH 15 ใบ - รันทุก 15 นาที ครั้งละ 15 ใบ วน 3 รอบครบ 46 ใบ
+// V31 FIXED - จับแค่ PSA10 + RAW A ล่าสุดเท่านั้น ไม่เอา B C PSA8-9
+// แก้ BOA-22-23-24-26 ที่ขึ้นวันที่ 11 ก.ย. ย้อนกลับไปใช้ราคาเก่ามั่ว
 import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { chromium } from 'playwright';
 
@@ -11,7 +12,6 @@ const BUCKET = process.env.R2_BUCKET || 'cardmatem-raw';
 const FILE_KEY = 'boa-prices.json';
 const RATE = 0.245;
 
-// Hardcode 46 ใบครบจาก Link_SNKR.txt
 const HARDCODE_MAP = {
   '713690': { productId: '824552', variantId: '9534253', key: 'BOA-01' },
   '714615': { productId: '826001', variantId: '9549494', key: 'BOA-02' },
@@ -60,75 +60,95 @@ const HARDCODE_MAP = {
   '220798': { productId: '296958', variantId: '2553525', key: 'BOA-46' },
 };
 
-async function getPrices() {
-  const res = await R2.send(new GetObjectCommand({ Bucket: BUCKET, Key: FILE_KEY }));
-  return JSON.parse(await res.Body.transformToString());
-}
-async function putPrices(data) {
-  data.updated = new Date().toISOString();
-  await R2.send(new PutObjectCommand({ Bucket: BUCKET, Key: FILE_KEY, Body: JSON.stringify(data,null,2), ContentType: 'application/json' }));
-}
+async function getPrices(){ const r=await R2.send(new GetObjectCommand({Bucket:BUCKET,Key:FILE_KEY})); return JSON.parse(await r.Body.transformToString()); }
+async function putPrices(d){ d.updated=new Date().toISOString(); await R2.send(new PutObjectCommand({Bucket:BUCKET,Key:FILE_KEY,Body:JSON.stringify(d,null,2),ContentType:'application/json'})); }
 
-async function scrapeOne(browser, apparelId) {
-  const map = HARDCODE_MAP[apparelId];
-  const { productId, variantId, key } = map;
-  const context = await browser.newContext({ userAgent: 'Mozilla/5.0 Chrome/120', locale: 'ja-JP' });
-  const page = await context.newPage();
-  try {
-    await page.goto(`https://snkrdunk.com/apparels/${apparelId}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(2000);
-    const prices = await page.evaluate(async ({ productId, variantId }) => {
-      const fetchPrice = async (code) => {
-        try {
-          const url = `https://snkrdunk.com/v3/products/${productId}/trading-history?range=all&condition_code=${code}&variant_id=${variantId}`;
-          const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
-          if (!res.ok) return { price: null };
-          const json = await res.json();
-          return { price: json.trades?.[0]?.price || null, count: json.trades?.length || 0 };
-        } catch { return { price: null }; }
+async function scrapeOne(browser, apparelId){
+  const map=HARDCODE_MAP[apparelId];
+  const {productId,variantId,key}=map;
+  const ctx=await browser.newContext({userAgent:'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120',locale:'ja-JP'});
+  const page=await ctx.newPage();
+  try{
+    await page.goto(`https://snkrdunk.com/apparels/${apparelId}`,{waitUntil:'domcontentloaded',timeout:30000});
+    await page.waitForTimeout(2500);
+    const result=await page.evaluate(async({productId,variantId})=>{
+      // 1. ลองแค่ 2 condition ที่ต้องการเท่านั้น: PSA10 + RAW A (nearly_unused)
+      const fetchCond=async(code)=>{
+        try{
+          const url=`https://snkrdunk.com/v3/products/${productId}/trading-history?range=all&condition_code=${code}&variant_id=${variantId}`;
+          const res=await fetch(url,{headers:{'Accept':'application/json'}});
+          if(!res.ok) return null;
+          const j=await res.json();
+          const price=j.trades?.[0]?.price;
+          // ต้องมากกว่า 3000 ถึงจะถือว่า valid ไม่ใช่ placeholder
+          if(price && price>3000) return price;
+          return null;
+        }catch{return null;}
       };
-      return { rawA: await fetchPrice('trading_card_single_nearly_unused'), psa10: await fetchPrice('trading_card_single_psa10') };
-    }, { productId, variantId });
-    await context.close();
-    return { rawA: prices.rawA.price, psa10: prices.psa10.price, productId, variantId, key, countA: prices.rawA.count, countP: prices.psa10.count };
-  } catch {
-    await context.close();
-    return { rawA: null, psa10: null, productId, variantId, key };
-  }
+      const psa10=await fetchCond('trading_card_single_psa10');
+      const rawA=await fetchCond('trading_card_single_nearly_unused');
+      // ถ้าไม่ได้ ให้ fallback ไป sales-chart จุดล่าสุด (อันนี้คือ RAW A จริงที่ SNKR โชว์หน้าเว็บ)
+      let fallback=null;
+      if(!rawA){
+        for(let opt=1; opt<=10; opt++){
+          try{
+            const r=await fetch(`/v1/apparels/${productId}/sales-chart/used?salesChartOptionId=${opt}`,{credentials:'include'});
+            if(!r.ok) continue;
+            const j=await r.json();
+            const pts=j.points||j.data?.points||[];
+            if(pts.length){
+              const last=pts[pts.length-1];
+              const v=Array.isArray(last)?last[1]:last.y||last.price;
+              const nv=parseInt(v,10);
+              if(nv>3000) {fallback=nv; break;}
+            }
+          }catch{}
+        }
+      }
+      return {psa10, rawA: rawA||fallback};
+    },{productId,variantId});
+    await ctx.close();
+    return {...result, key};
+  }catch(e){ await ctx.close(); return {psa10:null, rawA:null, key}; }
 }
 
-async function main() {
-  const allKeys = Object.keys(HARDCODE_MAP);
-  // BATCH logic: 0=0-14, 1=15-29, 2=30-44
-  const batchIdx = parseInt(process.env.BATCH || '0') % 3;
-  const batchSize = 15;
-  const batchKeys = allKeys.slice(batchIdx * batchSize, batchIdx * batchSize + batchSize);
-  
-  console.log(`=== V30 BATCH ${batchIdx+1}/3 - ${batchKeys.length} ใบ: ${batchKeys.map(k=>HARDCODE_MAP[k].key).join(', ')} ===`);
-  
-  const data = await getPrices();
-  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
-  let updated = 0;
-  for (const apparelId of batchKeys) {
-    const r = await scrapeOne(browser, apparelId);
-    let foundKey = null;
-    for (const k of Object.keys(data.prices)) if (data.prices[k].apparel_id == apparelId) { foundKey = k; break; }
-    if (!foundKey) foundKey = r.key;
-    if (!data.prices[foundKey]) data.prices[foundKey] = { apparel_id: apparelId };
-    const item = data.prices[foundKey];
-    if (r.rawA || r.psa10) {
-      if (r.rawA) { item.raw_jpy = r.rawA; item.jpy = r.rawA; item.raw_thb = Math.round(r.rawA * RATE); item.thb = Math.round(r.rawA * RATE); }
-      if (r.psa10) { item.psa10_jpy = r.psa10; item.psa_jpy = r.psa10; item.psa10_thb = Math.round(r.psa10 * RATE); item.psa_thb = Math.round(r.psa10 * RATE); }
-      item.product_id = r.productId; item.variant_id = r.variantId;
-      item.updated = new Date().toISOString();
-      item.source = `V30 BATCH ${batchIdx+1}/3`;
-      updated++;
-      console.log(`✅ ${foundKey} ¥${r.rawA||'-'}/${r.psa10||'-'} -> THB ${item.thb||'-'}/${item.psa_thb||'-'}`);
+async function main(){
+  const allKeys=Object.keys(HARDCODE_MAP);
+  const data=await getPrices();
+  const browser=await require('playwright').chromium.launch({headless:true,args:['--no-sandbox']});
+  // FIX: รันทีละใบที่ BOA-22,23,24,26 ก่อน เพื่อแก้ด่วน
+  const priority=['764614','681360','728141','728155']; // 22,23,24,26
+  const toRun = [...priority, ...allKeys.filter(k=>!priority.includes(k))].slice(0,15);
+  console.log('PRIORITY RUN:', toRun.map(k=>HARDCODE_MAP[k].key).join(','));
+  for(const aid of toRun){
+    const r=await scrapeOne(browser, aid);
+    const k=r.key;
+    if(!data.prices[k]) data.prices[k]={apparel_id:aid};
+    const item=data.prices[k];
+    let changed=false;
+    if(r.psa10 && r.psa10>3000){
+      // ไม่เอา PSA8-9, ไม่เอา B C
+      item.psa10_jpy=r.psa10; item.psa_jpy=r.psa10;
+      item.psa10_thb=Math.round(r.psa10*RATE); item.psa_thb=Math.round(r.psa10*RATE);
+      changed=true;
+      console.log(`✅ ${k} PSA10 ¥${r.psa10}`);
     }
-    await new Promise(r=>setTimeout(r,1000));
+    if(r.rawA && r.rawA>3000){
+      item.raw_jpy=r.rawA; item.jpy=r.rawA;
+      item.raw_thb=Math.round(r.rawA*RATE); item.thb=Math.round(r.rawA*RATE);
+      changed=true;
+      console.log(`✅ ${k} RAW A ¥${r.rawA}`);
+    }
+    if(changed){
+      item.updated=new Date().toISOString();
+      item.source='V31 PSA10+RAW A only';
+    } else {
+      console.log(`❌ ${k} skip - no valid PSA10/RAW A (keep old price, not overwrite with 1000)`);
+    }
+    await new Promise(r=>setTimeout(r,1200));
   }
   await browser.close();
-  if (updated>0) await putPrices(data);
-  console.log(`🎉 BATCH ${batchIdx+1}/3 DONE ${updated}/${batchKeys.length}`);
+  await putPrices(data);
+  console.log('DONE - ไม่ทับราคาดีด้วย 1000/3000 แล้ว');
 }
 main();
