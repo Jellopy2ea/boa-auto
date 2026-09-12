@@ -115,7 +115,7 @@ async function scrapeOne(browser, apparelId){
 async function main(){
   const allKeys=Object.keys(HARDCODE_MAP);
   const data=await getPrices();
-  const browser=await require('playwright').chromium.launch({headless:true,args:['--no-sandbox']});
+  const browser=await chromium.launch({headless:true,args:['--no-sandbox']});
   // FIX: รันทีละใบที่ BOA-22,23,24,26 ก่อน เพื่อแก้ด่วน
   const priority=['764614','681360','728141','728155']; // 22,23,24,26
   const toRun = [...priority, ...allKeys.filter(k=>!priority.includes(k))].slice(0,15);
