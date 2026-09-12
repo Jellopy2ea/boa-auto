@@ -1,5 +1,5 @@
-// V31 FIXED - จับแค่ PSA10 + RAW A ล่าสุดเท่านั้น ไม่เอา B C PSA8-9
-// แก้ BOA-22-23-24-26 ที่ขึ้นวันที่ 11 ก.ย. ย้อนกลับไปใช้ราคาเก่ามั่ว
+// V33 FINAL - ราคาขายแล้วล่าสุดเท่านั้น (Last Sale) PSA10 + RAW A
+// หน้านี้คือหน้าขายแล้วล่าสุด ไม่ใช่หน้าคนตั้งขาย - ตามที่ผู้ใช้ต้องการ
 import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { chromium } from 'playwright';
 
@@ -65,32 +65,30 @@ async function putPrices(d){ d.updated=new Date().toISOString(); await R2.send(n
 
 async function scrapeOne(browser, apparelId){
   const map=HARDCODE_MAP[apparelId];
-  const {productId,variantId,key}=map;
-  const ctx=await browser.newContext({userAgent:'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120',locale:'ja-JP'});
+  const {productId, key}=map;
+  const ctx=await browser.newContext({userAgent:'Mozilla/5.0 Chrome/120',locale:'ja-JP'});
   const page=await ctx.newPage();
   try{
-    await page.goto(`https://snkrdunk.com/apparels/${apparelId}`,{waitUntil:'domcontentloaded',timeout:30000});
-    await page.waitForTimeout(2500);
-    const result=await page.evaluate(async({productId,variantId})=>{
-      // 1. ลองแค่ 2 condition ที่ต้องการเท่านั้น: PSA10 + RAW A (nearly_unused)
-      const fetchCond=async(code)=>{
+    // ไปหน้า sales-histories = หน้าราคาขายแล้วล่าสุดโดยตรง
+    await page.goto(`https://snkrdunk.com/apparels/${apparelId}/sales-histories`,{waitUntil:'domcontentloaded',timeout:40000});
+    await page.waitForTimeout(3000);
+    const result=await page.evaluate(async({productId})=>{
+      // ฟังก์ชันดึงราคาขายแล้วล่าสุดตาม condition
+      const getLastSold = async (condition_code) => {
         try{
-          const url=`https://snkrdunk.com/v3/products/${productId}/trading-history?range=all&condition_code=${code}&variant_id=${variantId}`;
-          const res=await fetch(url,{headers:{'Accept':'application/json'}});
+          // API นี้คือราคาขายแล้วล่าสุด (Last Sale) ที่ SNKR ใช้วาดกราฟ
+          const url = `/v3/products/${productId}/trading-history?range=all&condition_code=${condition_code}&limit=1`;
+          const res = await fetch(url,{headers:{'Accept':'application/json'}});
           if(!res.ok) return null;
           const j=await res.json();
-          const price=j.trades?.[0]?.price;
-          // ต้องมากกว่า 3000 ถึงจะถือว่า valid ไม่ใช่ placeholder
-          if(price && price>3000) return price;
+          const price = j.trades?.[0]?.price || j.data?.trades?.[0]?.price;
+          if(price && price>1000) return price;
           return null;
         }catch{return null;}
       };
-      const psa10=await fetchCond('trading_card_single_psa10');
-      const rawA=await fetchCond('trading_card_single_nearly_unused');
-      // ถ้าไม่ได้ ให้ fallback ไป sales-chart จุดล่าสุด (อันนี้คือ RAW A จริงที่ SNKR โชว์หน้าเว็บ)
-      let fallback=null;
-      if(!rawA){
-        for(let opt=1; opt<=10; opt++){
+      const getLastSoldChart = async () => {
+        // Fallback: กราฟขายแล้วล่าสุด หน้า sales-histories ใช้ตัวนี้
+        for(let opt=1; opt<=15; opt++){
           try{
             const r=await fetch(`/v1/apparels/${productId}/sales-chart/used?salesChartOptionId=${opt}`,{credentials:'include'});
             if(!r.ok) continue;
@@ -100,55 +98,73 @@ async function scrapeOne(browser, apparelId){
               const last=pts[pts.length-1];
               const v=Array.isArray(last)?last[1]:last.y||last.price;
               const nv=parseInt(v,10);
-              if(nv>3000) {fallback=nv; break;}
+              if(nv>1000) return nv;
             }
           }catch{}
         }
+        return null;
+      };
+      
+      // ต้องการแค่ 2 อย่าง: PSA10 + RAW A (ขายแล้วล่าสุด)
+      let psa10 = await getLastSold('trading_card_single_psa10');
+      let rawA = await getLastSold('trading_card_single_nearly_unused');
+      
+      // RAW A ถ้าไม่มี trade ใน trading-history ให้เอาจากกราฟขายแล้วล่าสุด (คือหน้านี้เลย)
+      if(!rawA){
+        rawA = await getLastSoldChart();
       }
-      return {psa10, rawA: rawA||fallback};
-    },{productId,variantId});
+      // PSA10 ถ้าไม่มี ห้ามเอากราฟ RAW A มาใส่ ให้คง null ไว้
+      
+      return {psa10, rawA};
+    },{productId});
     await ctx.close();
-    return {...result, key};
-  }catch(e){ await ctx.close(); return {psa10:null, rawA:null, key}; }
+    return {...result, key, apparelId};
+  }catch(e){
+    await ctx.close();
+    return {psa10:null, rawA:null, key, apparelId};
+  }
 }
 
 async function main(){
   const allKeys=Object.keys(HARDCODE_MAP);
   const data=await getPrices();
   const browser=await chromium.launch({headless:true,args:['--no-sandbox']});
-  // FIX: รันทีละใบที่ BOA-22,23,24,26 ก่อน เพื่อแก้ด่วน
-  const priority=['764614','681360','728141','728155']; // 22,23,24,26
-  const toRun = [...priority, ...allKeys.filter(k=>!priority.includes(k))].slice(0,15);
-  console.log('PRIORITY RUN:', toRun.map(k=>HARDCODE_MAP[k].key).join(','));
-  for(const aid of toRun){
+  console.log('V33 - ราคาขายแล้วล่าสุดเท่านั้น PSA10 + RAW A - 46 ใบ');
+  for(const aid of allKeys){
     const r=await scrapeOne(browser, aid);
     const k=r.key;
-    if(!data.prices[k]) data.prices[k]={apparel_id:aid};
+    if(!data.prices[k]) data.prices[k]={apparel_id:aid, code:k};
     const item=data.prices[k];
     let changed=false;
-    if(r.psa10 && r.psa10>3000){
-      // ไม่เอา PSA8-9, ไม่เอา B C
+    
+    // PSA10 - ขายแล้วล่าสุดเท่านั้น
+    if(r.psa10 && r.psa10>1000){
       item.psa10_jpy=r.psa10; item.psa_jpy=r.psa10;
-      item.psa10_thb=Math.round(r.psa10*RATE); item.psa_thb=Math.round(r.psa10*RATE);
+      item.psa10_thb=Math.round(r.psa10*0.245); item.psa_thb=Math.round(r.psa10*0.245);
       changed=true;
-      console.log(`✅ ${k} PSA10 ¥${r.psa10}`);
+      console.log(`✅ ${k} PSA10 ขายแล้ว ¥${r.psa10}`);
+    } else {
+      console.log(`⏭️ ${k} PSA10 ไม่มีขายแล้ว - คงราคาเดิม`);
     }
-    if(r.rawA && r.rawA>3000){
+    
+    // RAW A - ขายแล้วล่าสุด (กราฟหน้านี้)
+    if(r.rawA && r.rawA>1000){
       item.raw_jpy=r.rawA; item.jpy=r.rawA;
-      item.raw_thb=Math.round(r.rawA*RATE); item.thb=Math.round(r.rawA*RATE);
+      item.raw_thb=Math.round(r.rawA*0.245); item.thb=Math.round(r.rawA*0.245);
       changed=true;
-      console.log(`✅ ${k} RAW A ¥${r.rawA}`);
+      console.log(`✅ ${k} RAW A ขายแล้ว ¥${r.rawA}`);
+    } else {
+      console.log(`⏭️ ${k} RAW A ไม่มีขายแล้ว`);
     }
+    
     if(changed){
       item.updated=new Date().toISOString();
-      item.source='V31 PSA10+RAW A only';
-    } else {
-      console.log(`❌ ${k} skip - no valid PSA10/RAW A (keep old price, not overwrite with 1000)`);
+      item.source='V33 Last Sale PSA10+RAW A';
     }
     await new Promise(r=>setTimeout(r,1200));
   }
   await browser.close();
   await putPrices(data);
-  console.log('DONE - ไม่ทับราคาดีด้วย 1000/3000 แล้ว');
+  console.log('DONE V33 - ราคาขายแล้วล่าสุดเท่านั้น');
 }
 main();
