@@ -13,9 +13,10 @@ const FILE_KEY = 'boa-prices.json';
 const RATE = 0.245;
 
 const HARDCODE_MAP = {
-  '713690': { productId: '824552', variantId: '9534253', key: 'BOA-01' },
+  '897039': { productId: '1033834', variantId: '11082376', key: 'BOA-01' },
   '714615': { productId: '826001', variantId: '9549494', key: 'BOA-02' },
   '710430': { productId: '820628', variantId: '9509094', key: 'BOA-03' },
+  '728157': { productId: '840836', variantId: '9641209', key: 'BOA-04' },
   '814021': { productId: '940195', variantId: '10369683', key: 'BOA-05' },
   '814022': { productId: '940196', variantId: '10369693', key: 'BOA-06' },
   '93516': { productId: '169690', variantId: '1894048', key: 'BOA-07' },
