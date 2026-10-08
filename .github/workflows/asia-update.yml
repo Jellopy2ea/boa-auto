@@ -2,7 +2,7 @@ name: Asia Price Update - 28 Cards
 
 on:
   schedule:
-    - cron: '15 * * * *'  # รันทุกชั่วโมงนาทีที่ 15  (ห่างจาก boa 15 นาที กันชน)
+    - cron: '15 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -15,7 +15,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '20'
 
       - name: Install deps
         run: |
@@ -25,24 +25,21 @@ jobs:
       - name: Run asia scraper
         run: |
           node asia-scraper.js
+          echo "=== asia-prices.json ==="
           cat asia-prices.json
           ls -lh
 
-      - name: Upload to R2 - asia-prices.json
-        uses: ryand56/r2-upload-action@latest
-        with:
-          r2-account-id: ${{ secrets.R2_ACCOUNT_ID }}
-          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
-          r2-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          r2-bucket: cardmatem-raw
-          source-dir: ./
-          destination-dir: ./
-          files: asia-prices.json
+      - name: Install AWS CLI for R2
+        run: |
+          pip install awscli --quiet || pip3 install awscli --quiet
 
-      # ถ้าใช้ wrangler แบบ boa เดิม ให้ใช้บล็อกนี้แทนด้านบน
-      # - name: Upload via Wrangler
-      #   run: |
-      #     npx wrangler r2 object put cardmatem-raw/asia-prices.json --file=./asia-prices.json
-      #   env:
-      #     CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-      #     CLOUDFLARE_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      - name: Upload to R2 - asia-prices.json
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: cardmatem-raw
+        run: |
+          aws s3 cp ./asia-prices.json s3://$R2_BUCKET/asia-prices.json --endpoint-url https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com --content-type application/json
+          echo "Uploaded asia-prices.json to R2"
+          aws s3 ls s3://$R2_BUCKET/ --endpoint-url https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com | grep asia
