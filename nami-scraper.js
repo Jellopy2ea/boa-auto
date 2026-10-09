@@ -14,26 +14,26 @@ const RATE = 0.245;
 
 const HARDCODE_MAP = {
   '650030': { productId: '750753', variantId: '9012053', key: 'NAMI-00' },
-  '310224': { productId: '386390', variantId: '3142948', key: 'NAMI-02' },
-  '729311': { productId: '842087', variantId: '9649300', key: 'NAMI-03' },
-  '710436': { productId: '820634', variantId: '9509154', key: 'NAMI-04' },
-  '854160': { productId: '985147', variantId: '10730578', key: 'NAMI-05' },
-  '135442': { productId: '211602', variantId: '2079706', key: 'NAMI-06' },
-  '435341': { productId: '511502', variantId: '4046805', key: 'NAMI-07' },
-  '477011': { productId: '554278', variantId: '4345908', key: 'NAMI-08' },
-  '708622': { productId: '818373', variantId: '9493035', key: 'NAMI-09' },
-  '708621': { productId: '818372', variantId: '9493025', key: 'NAMI-10' },
-  '837244': { productId: '966326', variantId: '10588770', key: 'NAMI-11' },
-  '506992': { productId: '588956', variantId: '4612928', key: 'NAMI-12' },
-  '297575': { productId: '373733', variantId: '3058766', key: 'NAMI-13' },
-  '349482': { productId: '425638', variantId: '3455938', key: 'NAMI-14' },
-  '129616': { productId: '205790', variantId: '2056337', key: 'NAMI-15' },
-  '714423': { productId: '825717', variantId: '9546684', key: 'NAMI-16' },
-  '141832': { productId: '217994', variantId: '2119839', key: 'NAMI-17' },
-  '102441': { productId: '178606', variantId: '1929505', key: 'NAMI-18' },
-  '515452': { productId: '598785', variantId: '4691622', key: 'NAMI-19' },
-  '198742': { productId: '274904', variantId: '2434660', key: 'NAMI-20' },
-  '825185': { productId: '952581', variantId: '10479554', key: 'NAMI-21' },
+  '310224': { productId: '386390', variantId: '3142948', key: 'NAMI-01' },
+  '729311': { productId: '842087', variantId: '9649300', key: 'NAMI-02' },
+  '710436': { productId: '820634', variantId: '9509154', key: 'NAMI-03' },
+  '854160': { productId: '985147', variantId: '10730578', key: 'NAMI-04' },
+  '135442': { productId: '211602', variantId: '2079706', key: 'NAMI-05' },
+  '435341': { productId: '511502', variantId: '4046805', key: 'NAMI-06' },
+  '477011': { productId: '554278', variantId: '4345908', key: 'NAMI-07' },
+  '708622': { productId: '818373', variantId: '9493035', key: 'NAMI-08' },
+  '708621': { productId: '818372', variantId: '9493025', key: 'NAMI-09' },
+  '837244': { productId: '966326', variantId: '10588770', key: 'NAMI-10' },
+  '506992': { productId: '588956', variantId: '4612928', key: 'NAMI-11' },
+  '297575': { productId: '373733', variantId: '3058766', key: 'NAMI-12' },
+  '349482': { productId: '425638', variantId: '3455938', key: 'NAMI-13' },
+  '129616': { productId: '205790', variantId: '2056337', key: 'NAMI-14' },
+  '714423': { productId: '825717', variantId: '9546684', key: 'NAMI-15' },
+  '141832': { productId: '217994', variantId: '2119839', key: 'NAMI-16' },
+  '102441': { productId: '178606', variantId: '1929505', key: 'NAMI-17' },
+  '515452': { productId: '598785', variantId: '4691622', key: 'NAMI-18' },
+  '198742': { productId: '274904', variantId: '2434660', key: 'NAMI-19' },
+  '825185': { productId: '952581', variantId: '10479554', key: 'NAMI-20' },
   '764629': { productId: '883639', variantId: '9986801', key: 'NAMI-22' },
   '221368': { productId: '297527', variantId: '2557601', key: 'NAMI-23' },
   '94918': { productId: '171091', variantId: '1899135', key: 'NAMI-24' },
@@ -158,20 +158,7 @@ async function main(){
   }
 
 
-  // Copy NAMI-00 price to NAMI-01 if NAMI-01 has no sale yet (same apparel 650030)
-  if(data.prices['NAMI-00'] && !data.prices['NAMI-01']){
-    data.prices['NAMI-01'] = { ...data.prices['NAMI-00'], code: 'NAMI-01', apparel_id: '650030' };
-  } else if(data.prices['NAMI-00'] && data.prices['NAMI-01']){
-    // If both exist, keep NAMI-00 as primary, but ensure NAMI-01 has same link
-    if(!data.prices['NAMI-01'].psa10_jpy || data.prices['NAMI-01'].psa10_jpy===1000){
-      data.prices['NAMI-01'].psa10_jpy = data.prices['NAMI-00'].psa10_jpy;
-      data.prices['NAMI-01'].psa10_thb = data.prices['NAMI-00'].psa10_thb;
-      data.prices['NAMI-01'].raw_jpy = data.prices['NAMI-00'].raw_jpy;
-      data.prices['NAMI-01'].raw_thb = data.prices['NAMI-00'].raw_thb;
-    }
-  }
-
-  for(let i=0;i<=52;i++){
+    for(let i=0;i<=52;i++){
     const k=`NAMI-${String(i).padStart(2,'0')}`;
     if(!data.prices[k]){
       data.prices[k]={
