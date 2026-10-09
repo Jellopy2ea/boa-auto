@@ -1,4 +1,4 @@
-// V33 FINAL NAMI - ราคาขายแล้วล่าสุดเท่านั้น (Last Sale) PSA10 + RAW A - 52 ใบ
+// V33 FINAL NAMI - ราคาขายแล้วล่าสุดเท่านั้น (Last Sale) PSA10 + RAW A - 53 ใบ
 // ใช้โครงสร้างเดียวกับ BOA V33
 import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { chromium } from 'playwright';
@@ -13,7 +13,7 @@ const FILE_KEY = 'nami-prices.json';
 const RATE = 0.245;
 
 const HARDCODE_MAP = {
-  '650030': { productId: '750753', variantId: '9012053', key: 'NAMI-01' },
+  '650030': { productId: '750753', variantId: '9012053', key: 'NAMI-00' },
   '310224': { productId: '386390', variantId: '3142948', key: 'NAMI-02' },
   '729311': { productId: '842087', variantId: '9649300', key: 'NAMI-03' },
   '710436': { productId: '820634', variantId: '9509154', key: 'NAMI-04' },
@@ -156,6 +156,35 @@ async function main(){
     }
     await new Promise(r=>setTimeout(r,1200));
   }
+
+
+  // Copy NAMI-00 price to NAMI-01 if NAMI-01 has no sale yet (same apparel 650030)
+  if(data.prices['NAMI-00'] && !data.prices['NAMI-01']){
+    data.prices['NAMI-01'] = { ...data.prices['NAMI-00'], code: 'NAMI-01', apparel_id: '650030' };
+  } else if(data.prices['NAMI-00'] && data.prices['NAMI-01']){
+    // If both exist, keep NAMI-00 as primary, but ensure NAMI-01 has same link
+    if(!data.prices['NAMI-01'].psa10_jpy || data.prices['NAMI-01'].psa10_jpy===1000){
+      data.prices['NAMI-01'].psa10_jpy = data.prices['NAMI-00'].psa10_jpy;
+      data.prices['NAMI-01'].psa10_thb = data.prices['NAMI-00'].psa10_thb;
+      data.prices['NAMI-01'].raw_jpy = data.prices['NAMI-00'].raw_jpy;
+      data.prices['NAMI-01'].raw_thb = data.prices['NAMI-00'].raw_thb;
+    }
+  }
+
+  for(let i=0;i<=52;i++){
+    const k=`NAMI-${String(i).padStart(2,'0')}`;
+    if(!data.prices[k]){
+      data.prices[k]={
+        apparel_id: "", code: k,
+        psa10_jpy: 1000, psa_jpy: 1000, raw_jpy: 1000, jpy: 1000,
+        psa10_thb: 245, psa_thb: 245, raw_thb: 245, thb: 245,
+        updated: new Date().toISOString(),
+        status: "รอเพิ่มลิ้งค์",
+        source: "placeholder"
+      };
+    }
+  }
+
   await browser.close();
   await putPrices(data);
   console.log('DONE V33 NAMI - '+Object.keys(data.prices).length+' items');
