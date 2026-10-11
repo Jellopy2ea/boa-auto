@@ -1,4 +1,4 @@
-name: BOA Auto Update
+name: BOA Price
 
 on:
   schedule:
