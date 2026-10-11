@@ -1,4 +1,4 @@
-name: Asia Price Update
+name: Asia Price
 
 on:
   schedule:
