@@ -1,4 +1,4 @@
-// V33 FINAL ROBIN - ราคาขายแล้วล่าสุดเท่านั้น (Last Sale) PSA10 + RAW A - 27 ใบ
+// V34 FINAL ROBIN - ราคาขายแล้วล่าสุดเท่านั้น (Last Sale) PSA10 + RAW A - 29 ใบ
 // ใช้โครงสร้างเดียวกับ BOA V33
 import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { chromium } from 'playwright';
@@ -40,6 +40,8 @@ const HARDCODE_MAP = {
   '764631': { productId: '883641', variantId: '9986821', key: 'ROBIN-25' },
   '893610': { productId: '1030108', variantId: '11061500', key: 'ROBIN-26' },
   '506994': { productId: '588958', variantId: '4612948', key: 'ROBIN-27' },
+  '822582': { productId: '949666', variantId: '10456488', key: 'ROBIN-28' },
+  '728149': { productId: '840828', variantId: '9641129', key: 'ROBIN-29' }
 };
 
 async function getPrices(){ try{ const r=await R2.send(new GetObjectCommand({Bucket:BUCKET,Key:FILE_KEY})); return JSON.parse(await r.Body.transformToString()); } catch { return { updated: new Date().toISOString(), prices: {} }; } }
@@ -99,7 +101,7 @@ async function main(){
   const allKeys=Object.keys(HARDCODE_MAP);
   const data=await getPrices();
   const browser=await chromium.launch({headless:true,args:['--no-sandbox']});
-  console.log(`V33 ROBIN - ราคาขายแล้วล่าสุด PSA10 + RAW A - ${allKeys.length} ใบ`);
+  console.log(`V34 ROBIN - ราคาขายแล้วล่าสุด PSA10 + RAW A - ${allKeys.length} ใบ`);
   for(const aid of allKeys){
     const r=await scrapeOne(browser, aid);
     const k=r.key;
@@ -124,7 +126,7 @@ async function main(){
     }
     if(changed){
       item.updated=new Date().toISOString();
-      item.source='V33 Last Sale ROBIN';
+      item.source='V34 Last Sale ROBIN';
       item.url=`https://snkrdunk.com/apparels/${aid}/sales-histories`;
       item.productId=HARDCODE_MAP[aid].productId;
       item.variantId=HARDCODE_MAP[aid].variantId;
@@ -133,7 +135,7 @@ async function main(){
   }
 
 
-    for(let i=1;i<=27;i++){
+    for(let i=1;i<=29;i++){
     const k=`ROBIN-${String(i).padStart(2,'0')}`;
     if(!data.prices[k]){
       data.prices[k]={
@@ -149,6 +151,6 @@ async function main(){
 
   await browser.close();
   await putPrices(data);
-  console.log('DONE V33 ROBIN - '+Object.keys(data.prices).length+' items');
+  console.log('DONE V34 ROBIN - '+Object.keys(data.prices).length+' items');
 }
 main();
