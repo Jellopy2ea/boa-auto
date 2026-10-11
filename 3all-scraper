@@ -1,0 +1,171 @@
+// V33 FINAL 3ALL - ราคาขายแล้วล่าสุดเท่านั้น (Last Sale) PSA10 + RAW A - 48 ใบ
+import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
+import { chromium } from 'playwright';
+
+const R2 = new S3Client({
+  region: 'auto',
+  endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  credentials: { accessKeyId: process.env.R2_ACCESS_KEY, secretAccessKey: process.env.R2_SECRET_KEY }
+});
+const BUCKET = process.env.R2_BUCKET || 'cardmatem-raw';
+const FILE_KEY = '3all-prices.json';
+const RATE = 0.245;
+
+const HARDCODE_MAP = {
+  '789185': { productId: '911623', variantId: '10184110', key: '3ALL-01' },
+  '822605': { productId: '949689', variantId: '10456718', key: '3ALL-02' },
+  '135443': { productId: '211603', variantId: '2079536', key: '3ALL-03' },
+  '676052': { productId: '780985', variantId: '9248576', key: '3ALL-04' },
+  '822609': { productId: '949693', variantId: '10456758', key: '3ALL-05' },
+  '136542': { productId: '212706', variantId: '2085380', key: '3ALL-06' },
+  '98665': { productId: '174839', variantId: '1913506', key: '3ALL-07' },
+  '126167': { productId: '202332', variantId: '2037061', key: '3ALL-08' },
+  '158329': { productId: '234492', variantId: '2208741', key: '3ALL-09' },
+  '93511': { productId: '169682', variantId: '1893978', key: '3ALL-10' },
+  '549072': { productId: '636847', variantId: '4977903', key: '3ALL-11' },
+  '503496': { productId: '584759', variantId: '4581300', key: '3ALL-12' },
+  '328424': { productId: '404581', variantId: '3289668', key: '3ALL-13' },
+  '93517': { productId: '169691', variantId: '1894068', key: '3ALL-14' },
+  '282726': { productId: '358885', variantId: '2946631', key: '3ALL-15' },
+  '328527': { productId: '404685', variantId: '3290768', key: '3ALL-16' },
+  '871077': { productId: '1004572', variantId: '10873579', key: '3ALL-17' },
+  '157932': { productId: '234095', variantId: '2207275', key: '3ALL-18' },
+  '168875': { productId: '245038', variantId: '2273111', key: '3ALL-19' },
+  '605812': { productId: '701483', variantId: '8616725', key: '3ALL-20' },
+  '503459': { productId: '584710', variantId: '4580445', key: '3ALL-21' },
+  '743937': { productId: '859176', variantId: '9769653', key: '3ALL-22' },
+  '333635': { productId: '409798', variantId: '3325378', key: '3ALL-23' },
+  '818477': { productId: '945082', variantId: '10425125', key: '3ALL-24' },
+  '588855': { productId: '682345', variantId: '8466855', key: '3ALL-25' },
+  '477017': { productId: '554284', variantId: '4345968', key: '3ALL-26' },
+  '708626': { productId: '818377', variantId: '9493075', key: '3ALL-27' },
+  '708627': { productId: '818378', variantId: '9493085', key: '3ALL-28' },
+  '751290': { productId: '867922', variantId: '9830760', key: '3ALL-29' },
+  '265749': { productId: '341902', variantId: '2822680', key: '3ALL-30' },
+  '435347': { productId: '511495', variantId: '4046732', key: '3ALL-31' },
+  '583602': { productId: '676409', variantId: '5277521', key: '3ALL-32' },
+  '588854': { productId: '682344', variantId: '8466845', key: '3ALL-33' },
+  '751291': { productId: '867923', variantId: '9830770', key: '3ALL-34' },
+  '503499': { productId: '584762', variantId: '4581330', key: '3ALL-35' },
+  '191179': { productId: '267342', variantId: '2389653', key: '3ALL-36' },
+  '735736': { productId: '849569', variantId: '9696043', key: '3ALL-37' },
+  '676023': { productId: '780949', variantId: '9248247', key: '3ALL-38' },
+  '265732': { productId: '341898', variantId: '2822500', key: '3ALL-39' },
+  '184930': { productId: '261094', variantId: '2363400', key: '3ALL-40' },
+  '202907': { productId: '279071', variantId: '2452518', key: '3ALL-41' },
+  '676056': { productId: '780989', variantId: '9248616', key: '3ALL-42' },
+  '478758': { productId: '556211', variantId: '4361595', key: '3ALL-43' },
+  '656334': { productId: '758196', variantId: '9078113', key: '3ALL-44' },
+  '754973': { productId: '872189', variantId: '9857200', key: '3ALL-45' },
+  '333636': { productId: '409791', variantId: '3325345', key: '3ALL-46' },
+  '911925': { productId: '1050540', variantId: '11193947', key: '3ALL-47' },
+  '650012': { productId: '750735', variantId: '9011873', key: '3ALL-48' },
+};
+
+async function getPrices(){ try{ const r=await R2.send(new GetObjectCommand({Bucket:BUCKET,Key:FILE_KEY})); return JSON.parse(await r.Body.transformToString()); } catch { return { updated: new Date().toISOString(), prices: {} }; } }
+async function putPrices(d){ d.updated=new Date().toISOString(); d.count=Object.keys(d.prices).length; await R2.send(new PutObjectCommand({Bucket:BUCKET,Key:FILE_KEY,Body:JSON.stringify(d,null,2),ContentType:'application/json'})); }
+
+async function scrapeOne(browser, apparelId){
+  const map=HARDCODE_MAP[apparelId];
+  const {productId, key}=map;
+  const ctx=await browser.newContext({userAgent:'Mozilla/5.0 Chrome/120',locale:'ja-JP'});
+  const page=await ctx.newPage();
+  try{
+    await page.goto(`https://snkrdunk.com/apparels/${apparelId}/sales-histories`,{waitUntil:'domcontentloaded',timeout:40000});
+    await page.waitForTimeout(3000);
+    const result=await page.evaluate(async({productId})=>{
+      const getLastSold = async (condition_code) => {
+        try{
+          const url = `/v3/products/${productId}/trading-history?range=all&condition_code=${condition_code}&limit=1`;
+          const res = await fetch(url,{headers:{'Accept':'application/json'}});
+          if(!res.ok) return null;
+          const j=await res.json();
+          const price = j.trades?.[0]?.price || j.data?.trades?.[0]?.price;
+          if(price && price>1000) return price;
+          return null;
+        }catch{return null;}
+      };
+      const getLastSoldChart = async () => {
+        for(let opt=1; opt<=15; opt++){
+          try{
+            const r=await fetch(`/v1/apparels/${productId}/sales-chart/used?salesChartOptionId=${opt}`,{credentials:'include'});
+            if(!r.ok) continue;
+            const j=await r.json();
+            const pts=j.points||j.data?.points||[];
+            if(pts.length){
+              const last=pts[pts.length-1];
+              const v=Array.isArray(last)?last[1]:last.y||last.price;
+              const nv=parseInt(v,10);
+              if(nv>1000) return nv;
+            }
+          }catch{}
+        }
+        return null;
+      };
+      let psa10 = await getLastSold('trading_card_single_psa10');
+      let rawA = await getLastSold('trading_card_single_nearly_unused');
+      if(!rawA){ rawA = await getLastSoldChart(); }
+      return {psa10, rawA};
+    },{productId});
+    await ctx.close();
+    return {...result, key, apparelId};
+  }catch(e){
+    await ctx.close();
+    return {psa10:null, rawA:null, key, apparelId};
+  }
+}
+
+async function main(){
+  const allKeys=Object.keys(HARDCODE_MAP);
+  const data=await getPrices();
+  const browser=await chromium.launch({headless:true,args:['--no-sandbox']});
+  console.log(`V33 3ALL - ราคาขายแล้วล่าสุด PSA10 + RAW A - ${allKeys.length} ใบ`);
+  for(const aid of allKeys){
+    const r=await scrapeOne(browser, aid);
+    const k=r.key;
+    if(!data.prices[k]) data.prices[k]={apparel_id:aid, code:k};
+    const item=data.prices[k];
+    let changed=false;
+    if(r.psa10 && r.psa10>1000){
+      item.psa10_jpy=r.psa10; item.psa_jpy=r.psa10;
+      item.psa10_thb=Math.round(r.psa10*RATE); item.psa_thb=Math.round(r.psa10*RATE);
+      changed=true;
+      console.log(`✅ ${k} PSA10 ขายแล้ว ¥${r.psa10}`);
+    } else {
+      console.log(`⏭ ${k} PSA10 ไม่มีขายแล้ว`);
+    }
+    if(r.rawA && r.rawA>1000){
+      item.raw_jpy=r.rawA; item.jpy=r.rawA;
+      item.raw_thb=Math.round(r.rawA*RATE); item.thb=Math.round(r.rawA*RATE);
+      changed=true;
+      console.log(`✅ ${k} RAW A ขายแล้ว ¥${r.rawA}`);
+    } else {
+      console.log(`⏭ ${k} RAW A ไม่มีขายแล้ว`);
+    }
+    if(changed){
+      item.updated=new Date().toISOString();
+      item.source='V33 Last Sale 3ALL';
+      item.url=`https://snkrdunk.com/apparels/${aid}/sales-histories`;
+      item.productId=HARDCODE_MAP[aid].productId;
+      item.variantId=HARDCODE_MAP[aid].variantId;
+    }
+    await new Promise(r=>setTimeout(r,1200));
+  }
+  for(let i=1;i<=48;i++){
+    const k=`3ALL-${String(i).padStart(2,'0')}`;
+    if(!data.prices[k]){
+      data.prices[k]={
+        apparel_id: "", code: k,
+        psa10_jpy: 1000, psa_jpy: 1000, raw_jpy: 1000, jpy: 1000,
+        psa10_thb: 245, psa_thb: 245, raw_thb: 245, thb: 245,
+        updated: new Date().toISOString(),
+        status: "รอเพิ่มลิ้งค์",
+        source: "placeholder"
+      };
+    }
+  }
+  await browser.close();
+  await putPrices(data);
+  console.log('DONE V33 3ALL - '+Object.keys(data.prices).length+' items');
+}
+main();
