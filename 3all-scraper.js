@@ -1,4 +1,4 @@
-// V33 FINAL 3ALL - ราคาขายแล้วล่าสุดเท่านั้น (Last Sale) PSA10 + RAW A - 48 ใบ
+// V33 FINAL 3ALL - FIXED ESM - 48 ใบ - ราคาขายแล้วล่าสุดเท่านั้น (Last Sale) PSA10 + RAW A - 48 ใบ
 import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { chromium } from 'playwright';
 
